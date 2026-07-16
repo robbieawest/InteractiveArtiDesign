@@ -59,5 +59,14 @@ alt+drag = orbit.
    - **Exploded view** — per-part outward offsets stored on the parts
      (`core/explode.ts`); collapse reverses exactly, including strokes
      segmented while exploded. (done)
+   - **SketchLab import** — `engine/importSketchLab.ts` loads glTF/GLB
+     exports of SketchLab documents (e.g. `SampleModels/`): stroke
+     centerlines are recovered from the triangular tube meshes
+     (`core/tubeCurve.ts`), baked to absolute world space, and tagged with
+     their `Part_*` ancestor. Joint nodes are counted but skipped until the
+     articulation framework exists. (done)
    - Joints (sliding/revolute), articulation discovery, skinning: not yet.
-     The Articulations panel is a placeholder.
+     The Articulations panel is a placeholder. Design decision (settled):
+     strokes stay stored in absolute rest-space; hierarchy will be joint
+     edges over part ids, with posing as derived per-part delta matrices —
+     never relative coordinate frames on strokes.

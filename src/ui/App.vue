@@ -223,6 +223,7 @@ import {
 } from "../core/undo";
 import { deserializeDocument, serializeDocument } from "../core/serialization";
 import { importLegacyPenzil, isLegacyPenzilJson } from "../core/legacyPenzil";
+import { importSketchLabGltf, parseGlb } from "../engine/importSketchLab";
 import type { SurfaceShape } from "../core/types";
 
 type ToolName = "draw" | "erase" | "select" | "segment";
@@ -385,6 +386,12 @@ function setTool(tool: ToolName): void {
 function setActivePart(partId: string): void {
   activePartId.value = partId;
   segmentTool?.setActivePart(partId);
+  // clicking a part also selects it (purple): drawing now targets it, and
+  // in select mode its strokes share a gizmo
+  selectTool?.select(
+    doc.strokesInPart(partId).map((s) => s.id),
+    partId,
+  );
 }
 
 function addPart(): void {
@@ -397,6 +404,7 @@ function addPart(): void {
 }
 
 function removePart(partId: string): void {
+  if (selectedPart.value === partId) selectTool?.deselect();
   doc.removePart(partId);
   if (activePartId.value === partId) {
     activePartId.value = null;
@@ -523,11 +531,44 @@ function downloadBlob(blob: Blob, filename: string): void {
 function loadFile(): void {
   const input = document.createElement("input");
   input.type = "file";
-  input.accept = ".json,application/json";
+  // .gltf/.glb (+ sidecar .bin): SketchLab exports; .json: our format or
+  // legacy Penzil. Multiple selection exists so a .gltf and its .bin can be
+  // picked together.
+  input.accept = ".json,.gltf,.glb,.bin,application/json";
+  input.multiple = true;
   input.onchange = async () => {
-    const file = input.files?.[0];
+    const files = [...(input.files ?? [])];
+    const byExt = (ext: string) =>
+      files.find((f) => f.name.toLowerCase().endsWith(ext));
+    const file = files[0];
     if (!file) return;
     try {
+      const gltfFile = byExt(".gltf");
+      const glbFile = byExt(".glb");
+      if (gltfFile || glbFile) {
+        const source = glbFile
+          ? parseGlb(await glbFile.arrayBuffer())
+          : {
+              json: JSON.parse(await gltfFile!.text()),
+              bin: await byExt(".bin")?.arrayBuffer(),
+            };
+        const imported = importSketchLabGltf(source.json, source.bin);
+        selectTool?.deselect();
+        doc.clear();
+        undoStack.clear();
+        activePartId.value = null;
+        segmentTool?.setActivePart(undefined);
+        for (const part of imported.parts) doc.addPart(part);
+        for (const stroke of imported.strokes) doc.addStroke(stroke);
+        partCounter = imported.parts.length;
+        if (imported.jointCount > 0) {
+          console.info(
+            `SketchLab import: skipped ${imported.jointCount} joints (articulations not implemented yet)`,
+          );
+        }
+        return;
+      }
+
       const json = JSON.parse(await file.text());
       selectTool?.deselect();
       doc.clear();

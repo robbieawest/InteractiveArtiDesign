@@ -19,6 +19,10 @@ import { pickStrokeAtCursor } from "../engine/picking";
  */
 export class SelectTool {
   private selection: string[] = [];
+  /** Whether this tool currently owns the pointer/highlights. Selection can
+   *  change while detached (e.g. clicking a part in the parts panel), in
+   *  which case only the logical state updates — no visuals. */
+  private attached = false;
   /** Set when the selection is exactly one whole part (double-click) —
    *  such selections glow purple and drawing auto-assigns to the part. */
   private partId: string | null = null;
@@ -37,6 +41,7 @@ export class SelectTool {
   ) {}
 
   attach(): void {
+    this.attached = true;
     const dom = this.viewport.renderer.domElement;
     dom.addEventListener("pointerdown", this.onPointerDown);
     dom.addEventListener("dblclick", this.onDoubleClick);
@@ -44,6 +49,9 @@ export class SelectTool {
     // selection survives tool switches; restore its visuals. A part
     // selection re-collects its strokes so ones drawn in the meantime are
     // included.
+    if (this.partId && !this.doc.getPart(this.partId)) {
+      this.setPartId(null); // part was deleted while another tool was active
+    }
     if (this.partId) {
       this.selection = this.doc.strokesInPart(this.partId).map((s) => s.id);
     }
@@ -55,6 +63,7 @@ export class SelectTool {
   }
 
   detach(): void {
+    this.attached = false;
     const dom = this.viewport.renderer.domElement;
     dom.removeEventListener("pointerdown", this.onPointerDown);
     dom.removeEventListener("dblclick", this.onDoubleClick);
@@ -159,18 +168,22 @@ export class SelectTool {
   };
 
   select(ids: string[], partId: string | null = null): void {
-    this.applyHighlights(false);
-    this.destroyGizmo();
+    if (this.attached) {
+      this.applyHighlights(false);
+      this.destroyGizmo();
+    }
     this.selection = ids.filter((id) => this.doc.getStroke(id));
-    this.setPartId(this.selection.length > 0 ? partId : null);
-    if (this.selection.length === 0) return;
+    // an empty part selection is allowed: selecting a brand-new part means
+    // "draw into this part" even before it has strokes
+    this.setPartId(partId);
+    if (this.selection.length === 0 || !this.attached) return;
 
     this.applyHighlights(true);
     this.buildGizmo();
   }
 
   deselect(): void {
-    this.applyHighlights(false);
+    if (this.attached) this.applyHighlights(false);
     this.selection = [];
     this.setPartId(null);
     this.destroyGizmo();
