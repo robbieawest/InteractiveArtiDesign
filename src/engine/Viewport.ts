@@ -34,6 +34,15 @@ export class Viewport {
   private rafHandle = 0;
   private disposed = false;
 
+  // Camera-interaction tracking, derived from raw input rather than
+  // camera-controls events (those fire "controlstart" even for unbound
+  // buttons and only report rest after damping settles).
+  private cameraPointerActive = false;
+  private wheelActive = false;
+  private wheelTimer: ReturnType<typeof setTimeout> | undefined;
+  private cameraActivityReported = false;
+  private readonly cameraActivityListeners = new Set<(active: boolean) => void>();
+
   constructor(container: HTMLElement) {
     this.container = container;
 
@@ -74,6 +83,13 @@ export class Viewport {
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
 
+    this.renderer.domElement.addEventListener("pointerdown", this.onCameraPointerDown);
+    window.addEventListener("pointerup", this.onCameraPointerUp);
+    window.addEventListener("pointercancel", this.onCameraPointerUp);
+    this.renderer.domElement.addEventListener("wheel", this.onCameraWheel, {
+      passive: true,
+    });
+
     this.resizeObserver = new ResizeObserver(() => this.onResize());
     this.resizeObserver.observe(container);
     this.onResize();
@@ -86,17 +102,83 @@ export class Viewport {
     this.needsRender = true;
   }
 
+  /** Downscaled snapshot of the current view (JPEG data URL). Renders
+   *  synchronously first so the drawing buffer is fresh to read. */
+  captureThumbnail(width = 192): string {
+    this.renderer.render(this.scene, this.camera);
+    const source = this.renderer.domElement;
+    const height = Math.max(
+      1,
+      Math.round((width * source.height) / Math.max(source.width, 1)),
+    );
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d")!.drawImage(source, 0, 0, width, height);
+    return canvas.toDataURL("image/jpeg", 0.75);
+  }
+
   /** True while a temporary key (space/alt) reroutes the left mouse button
    *  to the camera; tools should ignore pointer input in that state. */
   get cameraOwnsPointer(): boolean {
     return this.controls.mouseButtons.left !== CameraControls.ACTION.NONE;
   }
 
+  /** Notifies when the user starts/stops driving the camera (drag with a
+   *  camera button, or wheel — the latter settles after a short pause).
+   *  Returns an unsubscribe function. */
+  onCameraActivity(listener: (active: boolean) => void): () => void {
+    this.cameraActivityListeners.add(listener);
+    return () => this.cameraActivityListeners.delete(listener);
+  }
+
+  private emitCameraActivity(): void {
+    const active = this.cameraPointerActive || this.wheelActive;
+    if (active === this.cameraActivityReported) return;
+    this.cameraActivityReported = active;
+    for (const listener of this.cameraActivityListeners) listener(active);
+  }
+
+  private onCameraPointerDown = (event: PointerEvent): void => {
+    const cameraButton =
+      event.button === 1 ||
+      event.button === 2 ||
+      (event.button === 0 && this.cameraOwnsPointer);
+    if (cameraButton) {
+      this.cameraPointerActive = true;
+      this.emitCameraActivity();
+    }
+  };
+
+  private onCameraPointerUp = (): void => {
+    if (!this.cameraPointerActive) return;
+    this.cameraPointerActive = false;
+    this.emitCameraActivity();
+  };
+
+  private onCameraWheel = (): void => {
+    this.wheelActive = true;
+    this.emitCameraActivity();
+    clearTimeout(this.wheelTimer);
+    this.wheelTimer = setTimeout(() => {
+      this.wheelActive = false;
+      this.emitCameraActivity();
+    }, 250);
+  };
+
   dispose(): void {
     this.disposed = true;
     cancelAnimationFrame(this.rafHandle);
+    clearTimeout(this.wheelTimer);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
+    this.renderer.domElement.removeEventListener(
+      "pointerdown",
+      this.onCameraPointerDown,
+    );
+    window.removeEventListener("pointerup", this.onCameraPointerUp);
+    window.removeEventListener("pointercancel", this.onCameraPointerUp);
+    this.renderer.domElement.removeEventListener("wheel", this.onCameraWheel);
     this.resizeObserver.disconnect();
     this.controls.dispose();
     this.renderer.dispose();

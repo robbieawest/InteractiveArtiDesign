@@ -18,10 +18,17 @@
     </button>
     <button
       :class="{ active: activeTool === 'select' }"
-      title="Select (V) — click a stroke to select it; T/R/S set the gizmo, Delete removes it, Esc deselects"
+      title="Select (V) — click a stroke, double-click a part; T/R/S set the gizmo, Delete removes, Esc deselects"
       @click="setTool('select')"
     >
       Select
+    </button>
+    <button
+      :class="{ active: activeTool === 'segment' }"
+      title="Segment (G) — drag a pen through strokes to add/remove them from the active part (see Parts panel)"
+      @click="setTool('segment')"
+    >
+      Segment
     </button>
 
     <span class="divider" />
@@ -54,7 +61,10 @@
       >
         Reset canvas
       </button>
-      <select v-model="mirror" title="Mirror — also draw a twin stroke reflected across a world axis">
+      <select
+        v-model="mirror"
+        title="Mirror — also draw a twin stroke reflected across a world axis"
+      >
         <option value="off">No mirror</option>
         <option value="x">Mirror X</option>
         <option value="y">Mirror Y</option>
@@ -63,11 +73,7 @@
 
       <span class="divider" />
 
-      <input
-        v-model="strokeColor"
-        type="color"
-        title="Stroke color"
-      />
+      <input v-model="strokeColor" type="color" title="Stroke color" />
       <input
         v-model.number="strokeWidth"
         type="range"
@@ -84,6 +90,14 @@
         type="color"
         title="Fill color"
       />
+      <button
+        v-if="selectedPart"
+        class="part-chip"
+        title="New strokes join this part automatically (they preview purple). Click or press Esc to stop."
+        @click="selectTool?.deselect()"
+      >
+        Drawing into {{ doc.getPart(selectedPart)?.name ?? "part" }} ✕
+      </button>
     </template>
     <template v-else-if="activeTool === 'select'">
       <button
@@ -92,6 +106,24 @@
       >
         {{ gizmoMode }}
       </button>
+      <button
+        title="Deselect everything (Esc) — tip: ctrl+click adds/removes strokes from the selection, double-click selects a whole part"
+        @click="selectTool?.deselect()"
+      >
+        Deselect
+      </button>
+    </template>
+    <template v-else-if="activeTool === 'segment'">
+      <select
+        v-model="segmentMode"
+        title="Whether the pen adds strokes to the active part or removes them from it"
+      >
+        <option value="add">Pen adds</option>
+        <option value="remove">Pen removes</option>
+      </select>
+      <span class="hint">
+        {{ activePart ? "Painting: " + activePart.name : "No active part" }}
+      </span>
     </template>
   </div>
 
@@ -133,7 +165,28 @@
     </button>
   </div>
 
-  <div v-if="resetDialogOpen" class="modal-backdrop" @click.self="resetDialogOpen = false">
+  <bottom-panels
+    :expanded="expandedPanel"
+    :parts="partsList"
+    :poses="posesList"
+    :active-part-id="activePartId"
+    :stroke-counts="strokeCounts"
+    :exploded="exploded"
+    @set-expanded="expandedPanel = $event"
+    @set-active-part="setActivePart"
+    @add-part="addPart"
+    @remove-part="removePart"
+    @toggle-explode="toggleExplode"
+    @save-pose="savePose"
+    @apply-pose="applyPose"
+    @remove-pose="doc.removePose($event)"
+  />
+
+  <div
+    v-if="resetDialogOpen"
+    class="modal-backdrop"
+    @click.self="resetDialogOpen = false"
+  >
     <div class="modal">
       <p>
         This deletes every stroke and cannot be undone. Save your sketch
@@ -151,7 +204,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, useTemplateRef, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from "vue";
 import { Viewport } from "../engine/Viewport";
 import { StrokeRenderer } from "../engine/StrokeRenderer";
 import { CanvasSurface, type GizmoMode } from "../engine/CanvasSurface";
@@ -159,13 +212,20 @@ import { exportGlb } from "../engine/exportGlb";
 import { DrawTool, type MirrorAxis } from "../tools/DrawTool";
 import { EraseTool } from "../tools/EraseTool";
 import { SelectTool } from "../tools/SelectTool";
+import { SegmentTool, type SegmentMode } from "../tools/SegmentTool";
+import BottomPanels, { type PanelName } from "./BottomPanels.vue";
 import { SketchDocument } from "../core/SketchDocument";
-import { UndoStack } from "../core/undo";
+import {
+  UndoStack,
+  applyPoseCommand,
+  collapseCommand,
+  explodeCommand,
+} from "../core/undo";
 import { deserializeDocument, serializeDocument } from "../core/serialization";
 import { importLegacyPenzil, isLegacyPenzilJson } from "../core/legacyPenzil";
 import type { SurfaceShape } from "../core/types";
 
-type ToolName = "draw" | "erase" | "select";
+type ToolName = "draw" | "erase" | "select" | "segment";
 
 const viewportEl = useTemplateRef("viewportEl");
 const doc = new SketchDocument();
@@ -177,6 +237,7 @@ let surface: CanvasSurface | undefined;
 let tools: Record<ToolName, { attach(): void; detach(): void }> | undefined;
 let drawTool: DrawTool | undefined;
 let selectTool: SelectTool | undefined;
+let segmentTool: SegmentTool | undefined;
 
 const activeTool = ref<ToolName>("draw");
 const shape = ref<SurfaceShape>("plane");
@@ -184,12 +245,46 @@ const gizmoMode = ref<GizmoMode>("translate");
 const canvasVisible = ref(true);
 const mirror = ref<MirrorAxis>("off");
 const strokeColor = ref("#1c1c1e");
-const strokeWidth = ref(5);
+const strokeWidth = ref(8);
 const fillVisible = ref(false);
 const fillColor = ref("#1c1c1e");
 const canUndo = ref(false);
 const canRedo = ref(false);
 const resetDialogOpen = ref(false);
+
+// parts / poses / panels
+const expandedPanel = ref<PanelName | null>(null);
+const activePartId = ref<string | null>(null);
+/** The part selected via double-click in select mode; drawing joins it. */
+const selectedPart = ref<string | null>(null);
+const segmentMode = ref<SegmentMode>("add");
+const docVersion = ref(0);
+doc.subscribe(() => docVersion.value++);
+
+const partsList = computed(() => {
+  void docVersion.value;
+  return doc.allParts();
+});
+const posesList = computed(() => {
+  void docVersion.value;
+  return doc.allPoses();
+});
+const exploded = computed(() => {
+  void docVersion.value;
+  return doc.exploded;
+});
+const strokeCounts = computed(() => {
+  void docVersion.value;
+  const counts: Record<string, number> = {};
+  for (const stroke of doc.allStrokes()) {
+    if (stroke.partId) counts[stroke.partId] = (counts[stroke.partId] ?? 0) + 1;
+  }
+  return counts;
+});
+const activePart = computed(() =>
+  activePartId.value ? doc.getPart(activePartId.value) : undefined,
+);
+let partCounter = 0;
 
 undoStack.onChange = () => {
   canUndo.value = undoStack.canUndo;
@@ -202,12 +297,24 @@ onMounted(() => {
   surface = new CanvasSurface(viewport);
   drawTool = new DrawTool(viewport, surface, doc, undoStack);
   selectTool = new SelectTool(viewport, doc, undoStack, strokeRenderer);
+  selectTool.onPartSelectionChanged = (partId) => {
+    selectedPart.value = partId;
+  };
+  segmentTool = new SegmentTool(viewport, doc, undoStack, strokeRenderer);
   tools = {
     draw: drawTool,
     erase: new EraseTool(viewport, doc, undoStack, strokeRenderer),
     select: selectTool,
+    segment: segmentTool,
   };
   tools[activeTool.value].attach();
+
+  // gizmos get out of the way while the camera is being driven
+  viewport.onCameraActivity((active) => {
+    surface?.suppressGizmo("camera", active);
+    selectTool?.suppressGizmo(active);
+  });
+
   window.addEventListener("keydown", onKeyDown);
 });
 
@@ -220,7 +327,26 @@ onUnmounted(() => {
 });
 
 watch(shape, (value) => surface?.setShape(value));
+
+// while a part is selected, drawing targets it; keep its purple glow
+// current in draw mode (including strokes just drawn into it)
+watch([activeTool, selectedPart, docVersion], () => {
+  if (drawTool) drawTool.targetPartId = selectedPart.value ?? undefined;
+  if (activeTool.value !== "draw" || !strokeRenderer) return;
+  if (selectedPart.value) {
+    for (const stroke of doc.allStrokes()) {
+      strokeRenderer.setHighlight(
+        stroke.id,
+        stroke.partId === selectedPart.value,
+        "part",
+      );
+    }
+  } else {
+    strokeRenderer.clearHighlights();
+  }
+});
 watch(mirror, (value) => drawTool && (drawTool.mirrorAxis = value));
+watch(segmentMode, (value) => segmentTool && (segmentTool.mode = value));
 watch([strokeColor, strokeWidth], ([color, width]) => {
   if (drawTool) {
     drawTool.strokeStyle.color = color;
@@ -237,11 +363,75 @@ watch([fillVisible, fillColor], ([visible, color]) => {
 function setTool(tool: ToolName): void {
   if (!tools || tool === activeTool.value) return;
   tools[activeTool.value].detach();
+  strokeRenderer?.clearHighlights(); // each tool re-applies its own
   activeTool.value = tool;
   tools[tool].attach();
   // the canvas surface only participates in drawing; elsewhere it would
   // obstruct clicks on strokes
   surface?.setVisible(tool === "draw" && canvasVisible.value);
+
+  if (tool === "segment") {
+    // segmentation needs a target part: create one if none exists yet, and
+    // surface the parts panel for orientation
+    if (!activePartId.value) {
+      addPart();
+    } else {
+      segmentTool?.setActivePart(activePartId.value);
+    }
+    expandedPanel.value = "parts";
+  }
+}
+
+function setActivePart(partId: string): void {
+  activePartId.value = partId;
+  segmentTool?.setActivePart(partId);
+}
+
+function addPart(): void {
+  const part = {
+    id: crypto.randomUUID(),
+    name: `Part ${++partCounter}`,
+  };
+  doc.addPart(part);
+  setActivePart(part.id);
+}
+
+function removePart(partId: string): void {
+  doc.removePart(partId);
+  if (activePartId.value === partId) {
+    activePartId.value = null;
+    segmentTool?.setActivePart(undefined);
+  }
+}
+
+function toggleExplode(): void {
+  undoStack.push(doc.exploded ? collapseCommand(doc) : explodeCommand(doc));
+}
+
+function savePose(): void {
+  if (!viewport) return;
+  const name = prompt("Pose name", `Pose ${doc.allPoses().length + 1}`);
+  if (name === null) return;
+  const transforms: Record<string, import("../core/types").Transform> = {};
+  for (const stroke of doc.allStrokes()) {
+    transforms[stroke.id] = {
+      position: { ...stroke.transform.position },
+      quaternion: { ...stroke.transform.quaternion },
+      scale: { ...stroke.transform.scale },
+    };
+  }
+  doc.addPose({
+    id: crypto.randomUUID(),
+    name,
+    thumbnail: viewport.captureThumbnail(),
+    transforms,
+  });
+  expandedPanel.value = "poses";
+}
+
+function applyPose(poseId: string): void {
+  const pose = doc.getPose(poseId);
+  if (pose) undoStack.push(applyPoseCommand(doc, pose));
 }
 
 function cycleGizmoMode(): void {
@@ -275,12 +465,29 @@ function onKeyDown(event: KeyboardEvent): void {
   if (event.target instanceof HTMLElement && event.target.tagName !== "BODY") {
     return;
   }
-  if (event.code === "KeyT") setGizmoMode("translate");
+  if (event.code === "Escape") selectTool?.deselect();
+  else if (event.code === "KeyT") setGizmoMode("translate");
   else if (event.code === "KeyR") setGizmoMode("rotate");
   else if (event.code === "KeyS") setGizmoMode("scale");
   else if (event.code === "KeyD") setTool("draw");
   else if (event.code === "KeyE") setTool("erase");
   else if (event.code === "KeyV") setTool("select");
+  else if (event.code === "KeyG") setTool("segment");
+}
+
+function resetStrokes(): void {
+  selectTool?.deselect();
+  doc.clear();
+  undoStack.clear();
+  activePartId.value = null;
+  segmentTool?.setActivePart(undefined);
+  partCounter = 0;
+  resetDialogOpen.value = false;
+}
+
+function saveThenReset(): void {
+  saveFile();
+  resetStrokes();
 }
 
 function saveFile(): void {
@@ -304,17 +511,6 @@ async function exportFile(): Promise<void> {
   }
 }
 
-function resetStrokes(): void {
-  doc.clear();
-  undoStack.clear();
-  resetDialogOpen.value = false;
-}
-
-function saveThenReset(): void {
-  saveFile();
-  resetStrokes();
-}
-
 function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const el = document.createElement("a");
@@ -333,12 +529,21 @@ function loadFile(): void {
     if (!file) return;
     try {
       const json = JSON.parse(await file.text());
-      const strokes = isLegacyPenzilJson(json)
-        ? importLegacyPenzil(json)
-        : deserializeDocument(json).allStrokes();
+      selectTool?.deselect();
       doc.clear();
       undoStack.clear();
-      for (const stroke of strokes) doc.addStroke(stroke);
+      activePartId.value = null;
+      segmentTool?.setActivePart(undefined);
+      if (isLegacyPenzilJson(json)) {
+        for (const stroke of importLegacyPenzil(json)) doc.addStroke(stroke);
+      } else {
+        const loaded = deserializeDocument(json);
+        for (const part of loaded.allParts()) doc.addPart(part);
+        for (const pose of loaded.allPoses()) doc.addPose(pose);
+        doc.exploded = loaded.exploded;
+        for (const stroke of loaded.allStrokes()) doc.addStroke(stroke);
+        partCounter = loaded.allParts().length;
+      }
     } catch (error) {
       alert(`Could not load file: ${error}`);
     }
@@ -413,6 +618,22 @@ function loadFile(): void {
 .toolbar button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.hint {
+  font-size: 0.85em;
+  font-weight: 900;
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 18px;
+  padding: 8px 14px;
+}
+
+.toolbar button.part-chip {
+  background: #e3d1ff;
+}
+
+.toolbar button.part-chip:hover {
+  background: #d0b3ff;
 }
 
 .divider {

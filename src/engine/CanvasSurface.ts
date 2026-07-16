@@ -15,6 +15,8 @@ export class CanvasSurface {
   readonly mesh: THREE.Mesh;
   readonly controls: TransformControls;
   shape: SurfaceShape = "plane";
+  private visibleState = true;
+  private readonly gizmoSuppressions = new Set<string>();
 
   constructor(private readonly viewport: Viewport) {
     const material = new THREE.MeshToonMaterial({
@@ -35,6 +37,7 @@ export class CanvasSurface {
       viewport.camera,
       viewport.renderer.domElement,
     );
+    this.controls.setSize(0.5);
     this.controls.addEventListener("change", () => viewport.invalidate());
     viewport.scene.add(this.controls.getHelper());
     this.controls.attach(this.mesh);
@@ -72,9 +75,27 @@ export class CanvasSurface {
   }
 
   setVisible(visible: boolean): void {
+    this.visibleState = visible;
     this.mesh.visible = visible;
-    this.controls.enabled = visible;
-    this.controls.getHelper().visible = visible;
+    this.applyGizmoVisibility();
+  }
+
+  /** Temporarily hide the gizmo (while drawing, while the camera moves…).
+   *  Suppressions from different reasons stack; the gizmo returns when all
+   *  are lifted and the surface itself is visible. */
+  suppressGizmo(reason: string, on: boolean): void {
+    if (on) {
+      this.gizmoSuppressions.add(reason);
+    } else {
+      this.gizmoSuppressions.delete(reason);
+    }
+    this.applyGizmoVisibility();
+  }
+
+  private applyGizmoVisibility(): void {
+    const show = this.visibleState && this.gizmoSuppressions.size === 0;
+    this.controls.enabled = show;
+    this.controls.getHelper().visible = show;
     this.viewport.invalidate();
   }
 

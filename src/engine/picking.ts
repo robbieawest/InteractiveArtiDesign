@@ -53,6 +53,58 @@ export function pickStroke(
 }
 
 /**
+ * Every stroke whose centerline passes within `threshold` of the ray —
+ * front to back, no early out. This is the segmentation pen's "collision
+ * that goes through strokes".
+ */
+export function pickAllStrokes(
+  ray: THREE.Ray,
+  strokes: Iterable<PickableStroke>,
+  threshold = 0.08,
+): string[] {
+  const thresholdSq = threshold * threshold;
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const onRay = new THREE.Vector3();
+  const onSegment = new THREE.Vector3();
+
+  const hits: string[] = [];
+  for (const stroke of strokes) {
+    const p = stroke.points;
+    for (let i = 0; i + 5 < p.length; i += 3) {
+      a.fromArray(p, i).applyMatrix4(stroke.matrixWorld);
+      b.fromArray(p, i + 3).applyMatrix4(stroke.matrixWorld);
+      if (ray.distanceSqToSegment(a, b, onRay, onSegment) < thresholdSq) {
+        hits.push(stroke.id);
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
+/** Collect pickable centerlines for the whole document. */
+export function collectPickables(
+  viewport: Viewport,
+  doc: SketchDocument,
+  strokeRenderer: StrokeRenderer,
+): PickableStroke[] {
+  viewport.scene.updateMatrixWorld();
+  const candidates: PickableStroke[] = [];
+  for (const stroke of doc.allStrokes()) {
+    const group = strokeRenderer.groupFor(stroke.id);
+    if (group) {
+      candidates.push({
+        id: stroke.id,
+        points: stroke.points,
+        matrixWorld: group.matrixWorld,
+      });
+    }
+  }
+  return candidates;
+}
+
+/**
  * Full cursor pick used by the select/erase tools: centerline distance
  * first, then the fill surfaces (fills are real triangle meshes, so a plain
  * raycast works — clicking anywhere inside a filled stroke hits it).
@@ -65,19 +117,13 @@ export function pickStrokeAtCursor(
 ): string | undefined {
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(ndc, viewport.camera);
-  viewport.scene.updateMatrixWorld();
 
-  const candidates: PickableStroke[] = [];
+  const candidates = collectPickables(viewport, doc, strokeRenderer);
   const fillGroups: THREE.Object3D[] = [];
   for (const stroke of doc.allStrokes()) {
+    if (!stroke.fill.visible) continue;
     const group = strokeRenderer.groupFor(stroke.id);
-    if (!group) continue;
-    candidates.push({
-      id: stroke.id,
-      points: stroke.points,
-      matrixWorld: group.matrixWorld,
-    });
-    if (stroke.fill.visible) fillGroups.push(group);
+    if (group) fillGroups.push(group);
   }
 
   const byCenterline = pickStroke(raycaster.ray, candidates);

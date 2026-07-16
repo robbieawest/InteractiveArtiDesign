@@ -69,3 +69,23 @@ export interface Stroke {
 export function newStrokeId(): string {
   return crypto.randomUUID();
 }
+
+/** A named group of strokes (via `stroke.partId`) that poses and explodes
+ *  as a unit. */
+export interface Part {
+  id: string;
+  name: string;
+  /** While the document is exploded: the world offset this part was moved
+   *  by, so collapsing (including strokes segmented in the meantime) is the
+   *  exact reverse. */
+  explodeOffset?: Vec3;
+}
+
+/** A snapshot of stroke transforms, applied on demand from the poses panel. */
+export interface Pose {
+  id: string;
+  name: string;
+  /** Downscaled render of the viewport when the pose was saved (data URL). */
+  thumbnail: string;
+  transforms: Record<string, Transform>;
+}

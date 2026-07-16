@@ -1,5 +1,7 @@
 import type {
   FillStyle,
+  Part,
+  Pose,
   Stroke,
   StrokeStyle,
   SurfaceShape,
@@ -11,7 +13,9 @@ import { SketchDocument } from "./SketchDocument";
 // everything else is already plain data.
 
 export const FORMAT_NAME = "interactive-arti-design";
-export const FORMAT_VERSION = 2; // 1 = legacy Penzil (see legacyPenzil.ts)
+// 1 = legacy Penzil (see legacyPenzil.ts); 2 = strokes only;
+// 3 = adds parts, poses, exploded state
+export const FORMAT_VERSION = 3;
 
 interface StrokeJson {
   id: string;
@@ -28,12 +32,19 @@ export interface DocumentJson {
   format: typeof FORMAT_NAME;
   version: number;
   strokes: StrokeJson[];
+  /** Since version 3. */
+  parts?: Part[];
+  poses?: Pose[];
+  exploded?: boolean;
 }
 
 export function serializeDocument(doc: SketchDocument): DocumentJson {
   return {
     format: FORMAT_NAME,
     version: FORMAT_VERSION,
+    parts: doc.allParts(),
+    poses: doc.allPoses(),
+    exploded: doc.exploded,
     strokes: doc.allStrokes().map((s) => ({
       id: s.id,
       points: Array.from(s.points),
@@ -56,6 +67,9 @@ export function deserializeDocument(json: unknown): SketchDocument {
     throw new Error(`document version ${data.version} is newer than this app`);
   }
   const doc = new SketchDocument();
+  for (const part of data.parts ?? []) doc.addPart(part);
+  for (const pose of data.poses ?? []) doc.addPose(pose);
+  doc.exploded = data.exploded ?? false;
   for (const s of data.strokes) {
     const stroke: Stroke = {
       id: s.id,

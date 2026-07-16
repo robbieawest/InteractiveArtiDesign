@@ -11,6 +11,7 @@ import {
   computeVertexWidths,
   createRibbonMaterial,
 } from "../engine/ribbon";
+import { HIGHLIGHT_COLORS } from "../engine/StrokeRenderer";
 
 const SMOOTHING_WINDOW = 4;
 
@@ -24,12 +25,15 @@ const SMOOTHING_WINDOW = 4;
 export type MirrorAxis = "off" | "x" | "y" | "z";
 
 export class DrawTool {
-  strokeStyle: StrokeStyle = { visible: true, color: "#1c1c1e", width: 0.01 };
+  strokeStyle: StrokeStyle = { visible: true, color: "#1c1c1e", width: 0.016 };
   fillStyle: FillStyle = { visible: false, color: "#1c1c1e" };
   /** When set, each stroke also commits a twin reflected across the world
    *  plane perpendicular to this axis. The twin is an independent stroke
    *  (unlike Penzil's live-linked mirrors). */
   mirrorAxis: MirrorAxis = "off";
+  /** While a part is selected, new strokes join it automatically; the live
+   *  preview glows purple so the user knows. */
+  targetPartId?: string;
 
   private drawing = false;
   private points: number[] = [];
@@ -58,6 +62,8 @@ export class DrawTool {
     dom.removeEventListener("pointermove", this.onPointerMove);
     dom.removeEventListener("pointerup", this.onPointerUp);
     dom.removeEventListener("pointercancel", this.onPointerCancel);
+    this.drawing = false;
+    this.surface.suppressGizmo("drawing", false);
     this.discardPreview();
   }
 
@@ -72,6 +78,7 @@ export class DrawTool {
     this.drawing = true;
     this.points = [];
     this.smoothingBuffer = [];
+    this.surface.suppressGizmo("drawing", true);
     this.viewport.renderer.domElement.setPointerCapture(event.pointerId);
     this.addPoint(event);
   };
@@ -92,6 +99,7 @@ export class DrawTool {
   private onPointerCancel = (): void => {
     if (!this.drawing) return;
     this.drawing = false;
+    this.surface.suppressGizmo("drawing", false);
     this.discardPreview();
     this.viewport.invalidate();
   };
@@ -131,14 +139,18 @@ export class DrawTool {
     );
 
     if (!this.previewMesh) {
-      this.previewMesh = new THREE.Mesh(
-        geometry,
-        createRibbonMaterial(
-          this.strokeStyle.color,
-          this.strokeStyle.width,
-          this.viewport.resolution,
-        ),
+      const material = createRibbonMaterial(
+        this.strokeStyle.color,
+        this.strokeStyle.width,
+        this.viewport.resolution,
       );
+      if (this.targetPartId) {
+        material.uniforms.highlight.value = 1;
+        (material.uniforms.highlightColor.value as THREE.Color).copy(
+          HIGHLIGHT_COLORS.part,
+        );
+      }
+      this.previewMesh = new THREE.Mesh(geometry, material);
       this.viewport.scene.add(this.previewMesh);
     } else {
       this.previewMesh.geometry.dispose();
@@ -148,6 +160,7 @@ export class DrawTool {
   }
 
   private commit(): void {
+    this.surface.suppressGizmo("drawing", false);
     this.discardPreview();
 
     if (this.points.length / 3 >= 2) {
@@ -183,6 +196,7 @@ export class DrawTool {
         scale: { x: 1, y: 1, z: 1 },
       },
       surface: this.surface.snapshot(),
+      ...(this.targetPartId && { partId: this.targetPartId }),
     };
   }
 

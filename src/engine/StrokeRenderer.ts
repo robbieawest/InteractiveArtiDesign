@@ -8,6 +8,13 @@ import {
   createRibbonMaterial,
 } from "./ribbon";
 
+export type HighlightKind = "stroke" | "part";
+
+export const HIGHLIGHT_COLORS: Record<HighlightKind, THREE.Color> = {
+  stroke: new THREE.Color(1, 0.62, 0), // orange
+  part: new THREE.Color(0.62, 0.35, 1), // purple
+};
+
 /**
  * Mirrors the document into the three.js scene: one Group per stroke
  * (ribbon mesh + optional fill mesh), created/removed/moved in response to
@@ -26,6 +33,37 @@ export class StrokeRenderer {
   /** The scene group for a stroke, for raycasting/selection later. */
   groupFor(strokeId: string): THREE.Group | undefined {
     return this.groups.get(strokeId);
+  }
+
+  /** Tint a stroke with a selection color (ribbon via shader uniform, fill
+   *  by blending the material color). "stroke" glows orange, "part" purple. */
+  setHighlight(
+    strokeId: string,
+    on: boolean,
+    kind: HighlightKind = "stroke",
+  ): void {
+    const tint = HIGHLIGHT_COLORS[kind];
+    const group = this.groups.get(strokeId);
+    if (!group) return;
+    group.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return;
+      const material = object.material as THREE.Material;
+      if (material instanceof THREE.ShaderMaterial) {
+        material.uniforms.highlight.value = on ? 1 : 0;
+        (material.uniforms.highlightColor.value as THREE.Color).copy(tint);
+      } else if (material instanceof THREE.MeshBasicMaterial) {
+        if (!object.userData.baseColor) {
+          object.userData.baseColor = material.color.clone();
+        }
+        material.color.copy(object.userData.baseColor as THREE.Color);
+        if (on) material.color.lerp(tint, 0.65);
+      }
+    });
+    this.viewport.invalidate();
+  }
+
+  clearHighlights(): void {
+    for (const id of this.groups.keys()) this.setHighlight(id, false);
   }
 
   strokeIdFor(object: THREE.Object3D): string | undefined {

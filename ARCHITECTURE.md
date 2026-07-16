@@ -49,4 +49,15 @@ alt+drag = orbit.
    (color/width/fill), GLB export as variable-radius tubes
    (`engine/exportGlb.ts`). Keybinds: D/E/V tools, T/R/S gizmo mode,
    Delete/Esc selection, Ctrl+Z/Y undo. (done)
-6. Articulation: parts, joints, posing, explode, skinning.
+6. Articulation (in progress):
+   - **Parts** — `stroke.partId` + part registry in the document;
+     `tools/SegmentTool.ts` paints strokes into/out of the active part with
+     a through-everything pen (`pickAllStrokes`). (done)
+   - **Posing** — multi-select in `tools/SelectTool.ts` (double-click =
+     part) with one pivot gizmo; named pose snapshots with viewport
+     thumbnails, saved in the document. (done)
+   - **Exploded view** — per-part outward offsets stored on the parts
+     (`core/explode.ts`); collapse reverses exactly, including strokes
+     segmented while exploded. (done)
+   - Joints (sliding/revolute), articulation discovery, skinning: not yet.
+     The Articulations panel is a placeholder.

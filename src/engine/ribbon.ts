@@ -148,11 +148,14 @@ const vertexShader = /* glsl */ `
 const fragmentShader = /* glsl */ `
   uniform vec3 color;
   uniform float opacity;
+  uniform float highlight; // 0..1, blends toward highlightColor
+  uniform vec3 highlightColor;
 
   #include <fog_pars_fragment>
 
   void main() {
-    gl_FragColor = vec4(color, opacity);
+    vec3 c = mix(color, highlightColor, highlight * 0.65);
+    gl_FragColor = vec4(c, opacity);
     #include <fog_fragment>
   }
 `;
@@ -167,9 +170,12 @@ export function createRibbonMaterial(
     fragmentShader,
     fog: true,
     side: THREE.DoubleSide,
+    transparent: true,
     uniforms: {
       color: { value: new THREE.Color(color) },
-      opacity: { value: 1 },
+      opacity: { value: 0.9 },
+      highlight: { value: 0 },
+      highlightColor: { value: new THREE.Color(1, 0.62, 0) },
       lineWidth: { value: lineWidth },
       resolution: { value: resolution }, // shared instance, updated on resize
       fogColor: { value: new THREE.Color() },
