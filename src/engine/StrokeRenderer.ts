@@ -8,11 +8,12 @@ import {
   createRibbonMaterial,
 } from "./ribbon";
 
-export type HighlightKind = "stroke" | "part";
+export type HighlightKind = "stroke" | "part" | "jointChild";
 
 export const HIGHLIGHT_COLORS: Record<HighlightKind, THREE.Color> = {
   stroke: new THREE.Color(1, 0.62, 0), // orange
-  part: new THREE.Color(0.62, 0.35, 1), // purple
+  part: new THREE.Color(0.62, 0.35, 1), // purple (also a joint's parent part)
+  jointChild: new THREE.Color(1, 0.85, 0.1), // yellow (a joint's child part)
 };
 
 /**

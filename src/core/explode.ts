@@ -1,13 +1,20 @@
 import type { SketchDocument } from "./SketchDocument";
 import type { Vec3 } from "./types";
 
+export interface ExplodeLayout {
+  /** Outward offset per part at explode factor 1; scale for other factors. */
+  offsets: Map<string, Vec3>;
+  /** The sketch's overall center (mean of part centers), world space. */
+  center: Vec3;
+}
+
 /**
  * Outward offset per part for the exploded view: each part moves along the
  * direction from the sketch's overall center to the part's own center
  * (stroke pivots averaged), by a distance proportional to the sketch's
  * spread so small and large sketches both separate visibly.
  */
-export function computeExplodeOffsets(doc: SketchDocument): Map<string, Vec3> {
+export function computeExplodeLayout(doc: SketchDocument): ExplodeLayout {
   const centers = new Map<string, Vec3>();
   for (const part of doc.allParts()) {
     const strokes = doc.strokesInPart(part.id);
@@ -24,7 +31,9 @@ export function computeExplodeOffsets(doc: SketchDocument): Map<string, Vec3> {
       z: c.z / strokes.length,
     });
   }
-  if (centers.size === 0) return new Map();
+  if (centers.size === 0) {
+    return { offsets: new Map(), center: { x: 0, y: 0, z: 0 } };
+  }
 
   const global = { x: 0, y: 0, z: 0 };
   for (const c of centers.values()) {
@@ -72,5 +81,5 @@ export function computeExplodeOffsets(doc: SketchDocument): Map<string, Vec3> {
     }
     i++;
   }
-  return offsets;
+  return { offsets, center: global };
 }

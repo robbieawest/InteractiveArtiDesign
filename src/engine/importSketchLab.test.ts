@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { importSketchLabGltf } from "./importSketchLab";
+import { JOINT_DOF_NAMES, dofUnlocked, jointKindLabel } from "../core/types";
 
 // Integration test against the real SketchLab sample (the excavator from the
 // "Rapid Design of Articulated Objects" paper, exported via Sketchfab).
@@ -17,12 +18,43 @@ function loadSample() {
 }
 
 describe("importSketchLabGltf (excavator sample)", () => {
-  const { strokes, parts, jointCount } = loadSample();
+  const { strokes, parts, joints } = loadSample();
 
-  it("imports every stroke, part, and sees the joints", () => {
+  it("imports every stroke, part, and joint", () => {
     expect(strokes.length).toBe(973);
     expect(parts.length).toBe(23);
-    expect(jointCount).toBe(22);
+    expect(joints.length).toBe(22);
+  });
+
+  it("derives joint DoFs, axes, and ranges from the animation", () => {
+    const partIds = new Set(parts.map((p) => p.id));
+    const kinds = new Set(joints.map(jointKindLabel));
+    expect(kinds.has("revolute")).toBe(true);
+    expect(kinds.has("prismatic")).toBe(true);
+    for (const joint of joints) {
+      expect(partIds.has(joint.parentPartId)).toBe(true);
+      expect(partIds.has(joint.childPartId)).toBe(true);
+      // unit axis
+      expect(
+        Math.hypot(joint.axis.x, joint.axis.y, joint.axis.z),
+      ).toBeCloseTo(1, 5);
+      for (const dof of JOINT_DOF_NAMES) {
+        expect(joint.dofs[dof].value).toBe(0);
+        // ranges always contain the rest value
+        expect(joint.dofs[dof].range[0]).toBeLessThanOrEqual(0);
+        expect(joint.dofs[dof].range[1]).toBeGreaterThanOrEqual(0);
+      }
+      // the demo animation never swings off-axis
+      expect(dofUnlocked(joint.dofs.swingU)).toBe(false);
+      expect(dofUnlocked(joint.dofs.swingV)).toBe(false);
+      // pivots live inside the model's few-units world box
+      expect(Math.abs(joint.pivot.x)).toBeLessThan(10);
+      expect(Math.abs(joint.pivot.y)).toBeLessThan(10);
+      expect(Math.abs(joint.pivot.z)).toBeLessThan(10);
+    }
+    // each part is driven by at most one joint (a tree, not a graph)
+    const children = joints.map((j) => j.childPartId);
+    expect(new Set(children).size).toBe(children.length);
   });
 
   it("tags strokes with their owning part", () => {

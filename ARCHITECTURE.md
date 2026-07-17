@@ -56,17 +56,57 @@ alt+drag = orbit.
    - **Posing** — multi-select in `tools/SelectTool.ts` (double-click =
      part) with one pivot gizmo; named pose snapshots with viewport
      thumbnails, saved in the document. (done)
-   - **Exploded view** — per-part outward offsets stored on the parts
-     (`core/explode.ts`); collapse reverses exactly, including strokes
-     segmented while exploded. (done)
+   - **Exploded view** — a drag tool (`tools/ExplodeTool.ts`) toggled from
+     the Parts panel: dragging away from the model center scales per-part
+     outward offsets (`core/explode.ts`) by a factor clamped to [0, 4] —
+     it never goes past the original pose. Offsets are stored on the parts;
+     turning the tool off collapses exactly, including strokes segmented
+     while exploded. (done)
    - **SketchLab import** — `engine/importSketchLab.ts` loads glTF/GLB
      exports of SketchLab documents (e.g. `SampleModels/`): stroke
      centerlines are recovered from the triangular tube meshes
      (`core/tubeCurve.ts`), baked to absolute world space, and tagged with
-     their `Part_*` ancestor. Joint nodes are counted but skipped until the
-     articulation framework exists. (done)
-   - Joints (sliding/revolute), articulation discovery, skinning: not yet.
-     The Articulations panel is a placeholder. Design decision (settled):
-     strokes stay stored in absolute rest-space; hierarchy will be joint
-     edges over part ids, with posing as derived per-part delta matrices —
-     never relative coordinate frames on strokes.
+     their `Part_*` ancestor. `Joint_*` nodes give pivots directly; type,
+     axis, and range are mined from the embedded animation (delta rotations
+     → revolute axis, translation deltas → prismatic axis, observed
+     excursion → range). (done)
+   - **Joints** — screw-joint edges between parts (`core/types.ts`): one
+     axis (pivot point + unit direction, Plücker-style) with four
+     independent, individually ranged DoFs — `translation` (slide along the
+     axis), `twist` (about it), and `swingU`/`swingV` (about a deterministic
+     perpendicular basis, `jointBasis`). Fixed/revolute/prismatic/
+     cylindrical/ball are just labels derived from which DoFs are unlocked
+     (`jointKindLabel`); a locked DoF has range [0, 0]. Serialized since
+     format v5 (v4 typed joints migrate on load). Design decision (settled):
+     strokes always store absolute transforms and hierarchy lives on the
+     joint edges — never relative coordinate frames on strokes. Pivot/axis
+     are world-space at rest (all values 0); FK composes per-part delta
+     transforms (`core/articulation.ts` + `core/rigid.ts`, composition
+     order swing U → swing V → twist → slide), and articulating patches
+     member strokes by Δ(new)∘Δ(old)⁻¹ through the undo stack, exactly the
+     explode pattern. (done)
+   - **Articulate tool** — `tools/ArticulateTool.ts` (keybind A): click a
+     part to get a gizmo constrained to its driving joint's axis (ring for
+     revolute, arrow for prismatic), clamped to the range. Clicking a joint
+     in the Articulations panel selects it the same way (switches to the
+     tool and shows its gizmo); the panel lists joints, resets the pose,
+     and toggles IK:
+     with IK on, dragging a part translates it freely and CCD
+     (`solveIK`, per-DoF) solves the joint chain backwards. The rotate
+     gizmo shows one ring per unlocked rotational DoF; T/R switch to the
+     slide arrow when a joint has both. Disabled while exploded (rest
+     pivots don't apply). (done)
+   - **Joint tool** — `tools/JointTool.ts` (keybind J): authoring and
+     editing are one process. Drag from a parent part to a child part to
+     create a joint (default axis parent→child at the child's centroid,
+     all DoFs locked; the child's old driver is replaced in the same undo
+     step, and cycles are refused). Click a part to edit its driving
+     joint: parent highlights purple, child yellow, and a gizmo places the
+     axis (T moves the pivot, R aims the direction — roll is hidden since
+     U/V derive from the axis). Ranges are *demonstrated*: arm a DoF in
+     the Articulations panel and drag the child through the motion — the
+     extremes reached become the range (mirror toggle symmetrizes); on
+     release the part snaps back to rest. The tool always works at the
+     rest pose (posed joints are zeroed first, undoably).
+     `engine/JointLines.ts` draws parent↔child lines while exploded. (done)
+   - Articulation discovery, skinning: not yet.

@@ -30,6 +30,20 @@
     >
       Segment
     </button>
+    <button
+      :class="{ active: activeTool === 'articulate' }"
+      title="Articulate (A) — click a part to drive its joint along its axis; toggle IK in the Articulations panel to drag parts freely (collapse the exploded view first)"
+      @click="setTool('articulate')"
+    >
+      Articulate
+    </button>
+    <button
+      :class="{ active: activeTool === 'joint' }"
+      title="Joint (J) — drag from a parent part to a child part to create a joint; click a part to edit the joint that drives it"
+      @click="setTool('joint')"
+    >
+      Joint
+    </button>
 
     <span class="divider" />
 
@@ -113,6 +127,15 @@
         Deselect
       </button>
     </template>
+    <template v-else-if="activeTool === 'joint'">
+      <span class="hint">{{ jointHint }}</span>
+    </template>
+    <template v-else-if="activeTool === 'explode'">
+      <span class="hint">
+        Drag away from the model's center to explode it; turn explode off in
+        the Parts panel to restore the original pose
+      </span>
+    </template>
     <template v-else-if="activeTool === 'segment'">
       <select
         v-model="segmentMode"
@@ -169,9 +192,15 @@
     :expanded="expandedPanel"
     :parts="partsList"
     :poses="posesList"
+    :joints="jointsList"
+    :ik="ikEnabled"
+    :selected-joint-id="selectedJointId"
+    :editing-joint-id="editingJointId"
+    :armed-dof="armedDof"
+    :mirror="mirrorRange"
     :active-part-id="activePartId"
     :stroke-counts="strokeCounts"
-    :exploded="exploded"
+    :exploding="activeTool === 'explode'"
     @set-expanded="expandedPanel = $event"
     @set-active-part="setActivePart"
     @add-part="addPart"
@@ -180,6 +209,14 @@
     @save-pose="savePose"
     @apply-pose="applyPose"
     @remove-pose="doc.removePose($event)"
+    @toggle-ik="ikEnabled = !ikEnabled"
+    @reset-articulation="resetArticulation"
+    @select-joint="selectJoint"
+    @edit-joint="editJoint"
+    @delete-joint="deleteJoint"
+    @new-joint="newJoint"
+    @arm-dof="jointTool?.armDof($event)"
+    @toggle-mirror="jointTool?.setMirror(!mirrorRange)"
   />
 
   <div
@@ -207,26 +244,37 @@
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from "vue";
 import { Viewport } from "../engine/Viewport";
 import { StrokeRenderer } from "../engine/StrokeRenderer";
+import { JointLines } from "../engine/JointLines";
 import { CanvasSurface, type GizmoMode } from "../engine/CanvasSurface";
 import { exportGlb } from "../engine/exportGlb";
 import { DrawTool, type MirrorAxis } from "../tools/DrawTool";
 import { EraseTool } from "../tools/EraseTool";
 import { SelectTool } from "../tools/SelectTool";
 import { SegmentTool, type SegmentMode } from "../tools/SegmentTool";
+import { ArticulateTool } from "../tools/ArticulateTool";
+import { JointTool } from "../tools/JointTool";
+import { ExplodeTool } from "../tools/ExplodeTool";
 import BottomPanels, { type PanelName } from "./BottomPanels.vue";
 import { SketchDocument } from "../core/SketchDocument";
 import {
   UndoStack,
   applyPoseCommand,
-  collapseCommand,
-  explodeCommand,
+  resetArticulationCommand,
 } from "../core/undo";
 import { deserializeDocument, serializeDocument } from "../core/serialization";
 import { importLegacyPenzil, isLegacyPenzilJson } from "../core/legacyPenzil";
 import { importSketchLabGltf, parseGlb } from "../engine/importSketchLab";
-import type { SurfaceShape } from "../core/types";
+import type { JointDofName, SurfaceShape } from "../core/types";
+import { jointPosed } from "../core/types";
 
-type ToolName = "draw" | "erase" | "select" | "segment";
+type ToolName =
+  | "draw"
+  | "erase"
+  | "select"
+  | "segment"
+  | "articulate"
+  | "joint"
+  | "explode";
 
 const viewportEl = useTemplateRef("viewportEl");
 const doc = new SketchDocument();
@@ -239,6 +287,9 @@ let tools: Record<ToolName, { attach(): void; detach(): void }> | undefined;
 let drawTool: DrawTool | undefined;
 let selectTool: SelectTool | undefined;
 let segmentTool: SegmentTool | undefined;
+let articulateTool: ArticulateTool | undefined;
+let jointTool: JointTool | undefined;
+let jointLines: JointLines | undefined;
 
 const activeTool = ref<ToolName>("draw");
 const shape = ref<SurfaceShape>("plane");
@@ -259,6 +310,13 @@ const activePartId = ref<string | null>(null);
 /** The part selected via double-click in select mode; drawing joins it. */
 const selectedPart = ref<string | null>(null);
 const segmentMode = ref<SegmentMode>("add");
+const ikEnabled = ref(false);
+/** The joint whose gizmo the Articulate tool is showing. */
+const selectedJointId = ref<string | null>(null);
+/** Joint-tool state: the joint being edited and the DoF being demonstrated. */
+const editingJointId = ref<string | null>(null);
+const armedDof = ref<JointDofName | null>(null);
+const mirrorRange = ref(false);
 const docVersion = ref(0);
 doc.subscribe(() => docVersion.value++);
 
@@ -270,9 +328,9 @@ const posesList = computed(() => {
   void docVersion.value;
   return doc.allPoses();
 });
-const exploded = computed(() => {
+const jointsList = computed(() => {
   void docVersion.value;
-  return doc.exploded;
+  return doc.allJoints();
 });
 const strokeCounts = computed(() => {
   void docVersion.value;
@@ -302,11 +360,25 @@ onMounted(() => {
     selectedPart.value = partId;
   };
   segmentTool = new SegmentTool(viewport, doc, undoStack, strokeRenderer);
+  articulateTool = new ArticulateTool(viewport, doc, undoStack, strokeRenderer);
+  articulateTool.onJointSelected = (jointId) => {
+    selectedJointId.value = jointId;
+  };
+  jointTool = new JointTool(viewport, doc, undoStack, strokeRenderer);
+  jointTool.onStateChanged = (state) => {
+    editingJointId.value = state.jointId;
+    armedDof.value = state.armedDof;
+    mirrorRange.value = state.mirror;
+  };
+  jointLines = new JointLines(doc, viewport);
   tools = {
     draw: drawTool,
     erase: new EraseTool(viewport, doc, undoStack, strokeRenderer),
     select: selectTool,
     segment: segmentTool,
+    articulate: articulateTool,
+    joint: jointTool,
+    explode: new ExplodeTool(viewport, doc, undoStack),
   };
   tools[activeTool.value].attach();
 
@@ -314,6 +386,8 @@ onMounted(() => {
   viewport.onCameraActivity((active) => {
     surface?.suppressGizmo("camera", active);
     selectTool?.suppressGizmo(active);
+    articulateTool?.suppressGizmo(active);
+    jointTool?.suppressGizmo(active);
   });
 
   window.addEventListener("keydown", onKeyDown);
@@ -322,6 +396,7 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener("keydown", onKeyDown);
   tools?.[activeTool.value].detach();
+  jointLines?.dispose();
   surface?.dispose();
   strokeRenderer?.dispose();
   viewport?.dispose();
@@ -347,6 +422,7 @@ watch([activeTool, selectedPart, docVersion], () => {
   }
 });
 watch(mirror, (value) => drawTool && (drawTool.mirrorAxis = value));
+watch(ikEnabled, (value) => articulateTool?.setIkMode(value));
 watch(segmentMode, (value) => segmentTool && (segmentTool.mode = value));
 watch([strokeColor, strokeWidth], ([color, width]) => {
   if (drawTool) {
@@ -371,7 +447,11 @@ function setTool(tool: ToolName): void {
   // obstruct clicks on strokes
   surface?.setVisible(tool === "draw" && canvasVisible.value);
 
-  if (tool === "segment") {
+  if (tool === "explode") {
+    expandedPanel.value = "parts";
+  } else if (tool === "joint") {
+    expandedPanel.value = "articulations";
+  } else if (tool === "segment") {
     // segmentation needs a target part: create one if none exists yet, and
     // surface the parts panel for orientation
     if (!activePartId.value) {
@@ -380,7 +460,41 @@ function setTool(tool: ToolName): void {
       segmentTool?.setActivePart(activePartId.value);
     }
     expandedPanel.value = "parts";
+  } else if (tool === "articulate") {
+    expandedPanel.value = "articulations";
   }
+}
+
+function resetArticulation(): void {
+  if (doc.allJoints().some(jointPosed)) {
+    undoStack.push(resetArticulationCommand(doc));
+  }
+}
+
+const jointHint = computed(() => {
+  if (!editingJointId.value) {
+    return "Drag from a parent part to a child part to create a joint; click a part to edit its joint";
+  }
+  if (armedDof.value) {
+    return "Drag the gizmo through the motion — the extremes you reach become the range; release to snap back";
+  }
+  return "T moves the pivot, R aims the axis; arm a DoF in the panel to demonstrate its range";
+});
+
+function editJoint(jointId: string): void {
+  setTool("joint");
+  jointTool?.selectJoint(jointId);
+}
+
+function newJoint(): void {
+  setTool("joint");
+  jointTool?.deselect();
+}
+
+function deleteJoint(jointId: string): void {
+  // the articulate gizmo may be sitting on this joint
+  articulateTool?.deselect();
+  jointTool?.deleteJoint(jointId);
 }
 
 function setActivePart(partId: string): void {
@@ -413,7 +527,14 @@ function removePart(partId: string): void {
 }
 
 function toggleExplode(): void {
-  undoStack.push(doc.exploded ? collapseCommand(doc) : explodeCommand(doc));
+  // turning the tool off (or switching to any other tool) collapses the
+  // parts back to their original pose
+  setTool(activeTool.value === "explode" ? "select" : "explode");
+}
+
+function selectJoint(jointId: string): void {
+  setTool("articulate");
+  articulateTool?.selectJoint(jointId);
 }
 
 function savePose(): void {
@@ -481,6 +602,8 @@ function onKeyDown(event: KeyboardEvent): void {
   else if (event.code === "KeyE") setTool("erase");
   else if (event.code === "KeyV") setTool("select");
   else if (event.code === "KeyG") setTool("segment");
+  else if (event.code === "KeyA") setTool("articulate");
+  else if (event.code === "KeyJ") setTool("joint");
 }
 
 function resetStrokes(): void {
@@ -560,12 +683,8 @@ function loadFile(): void {
         segmentTool?.setActivePart(undefined);
         for (const part of imported.parts) doc.addPart(part);
         for (const stroke of imported.strokes) doc.addStroke(stroke);
+        for (const joint of imported.joints) doc.addJoint(joint);
         partCounter = imported.parts.length;
-        if (imported.jointCount > 0) {
-          console.info(
-            `SketchLab import: skipped ${imported.jointCount} joints (articulations not implemented yet)`,
-          );
-        }
         return;
       }
 

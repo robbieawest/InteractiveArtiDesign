@@ -30,14 +30,15 @@
             <button @click="$emit('add-part')">New part</button>
             <button
               :disabled="parts.length === 0"
+              :class="{ active: exploding }"
               :title="
-                exploded
-                  ? 'Bring all parts back to their original placement'
-                  : 'Push all parts away from each other'
+                exploding
+                  ? 'Turn the explode tool off — every part returns to its original placement'
+                  : 'Explode tool — left-drag away from the model center to spread the parts apart'
               "
               @click="$emit('toggle-explode')"
             >
-              {{ exploded ? "Collapse" : "Explode" }}
+              {{ exploding ? "Turn off explode" : "Explode" }}
             </button>
           </div>
         </template>
@@ -73,8 +74,87 @@
 
         <!-- Articulations -->
         <template v-else>
-          <div class="empty">
-            Articulations (sliding/revolute joints) are not implemented yet.
+          <div v-if="joints.length === 0" class="empty">
+            No joints yet. Click "New joint" and drag from one part to
+            another, or load a SketchLab model (.gltf) to bring in its rig.
+          </div>
+          <template v-for="joint in joints" :key="joint.id">
+            <div
+              class="row"
+              :class="{ active: joint.id === selectedJointId || joint.id === editingJointId }"
+              :title="jointTooltip(joint)"
+              @click="$emit('select-joint', joint.id)"
+            >
+              <span class="row-label">{{ joint.name }}</span>
+              <span class="count">{{ jointKindLabel(joint) }}</span>
+              <span class="count value">{{ jointValueLabel(joint) }}</span>
+              <button
+                class="mini"
+                title="Edit this joint (Joint tool): place its axis, demonstrate its ranges"
+                @click.stop="$emit('edit-joint', joint.id)"
+              >
+                ✎
+              </button>
+              <button
+                class="mini danger"
+                title="Delete this joint (the parts stay)"
+                @click.stop="$emit('delete-joint', joint.id)"
+              >
+                ×
+              </button>
+            </div>
+            <template v-if="joint.id === editingJointId">
+              <div
+                v-for="dof in JOINT_DOF_NAMES"
+                :key="dof"
+                class="row dof-row"
+                :class="{ active: dof === armedDof }"
+                :title="'Click to arm this DoF, then drag the gizmo through the motion — the extremes you reach become its range. Click again to disarm.'"
+                @click="$emit('arm-dof', dof)"
+              >
+                <span class="row-label">{{ DOF_LABELS[dof] }}</span>
+                <span class="count value">{{ dofRangeLabel(joint, dof) }}</span>
+                <span v-if="dof === armedDof" class="count recording">●</span>
+              </div>
+              <label
+                class="row dof-row mirror-toggle"
+                title="Commit demonstrated ranges symmetrically (± the largest extreme)"
+              >
+                <input
+                  type="checkbox"
+                  :checked="mirror"
+                  @change="$emit('toggle-mirror')"
+                />
+                Mirror range
+              </label>
+            </template>
+          </template>
+          <div class="panel-actions">
+            <button
+              title="Create a joint (Joint tool): drag from the parent part to the child part in the viewport"
+              @click="$emit('new-joint')"
+            >
+              New joint
+            </button>
+            <label
+              v-if="joints.length > 0"
+              class="ik-toggle"
+              title="Inverse kinematics — drag a part freely with the Articulate tool and the joint chain solves to follow"
+            >
+              <input
+                type="checkbox"
+                :checked="ik"
+                @change="$emit('toggle-ik')"
+              />
+              IK
+            </label>
+            <button
+              v-if="joints.length > 0"
+              title="Return every joint to its rest pose (undoable)"
+              @click="$emit('reset-articulation')"
+            >
+              Reset pose
+            </button>
           </div>
         </template>
       </div>
@@ -92,7 +172,8 @@
 </template>
 
 <script setup lang="ts">
-import type { Part, Pose } from "../core/types";
+import type { Joint, JointDofName, Part, Pose } from "../core/types";
+import { JOINT_DOF_NAMES, dofUnlocked, jointKindLabel } from "../core/types";
 
 export type PanelName = "parts" | "poses" | "articulations";
 
@@ -100,9 +181,15 @@ defineProps<{
   expanded: PanelName | null;
   parts: Part[];
   poses: Pose[];
+  joints: Joint[];
+  ik: boolean;
+  selectedJointId: string | null;
+  editingJointId: string | null;
+  armedDof: JointDofName | null;
+  mirror: boolean;
   activePartId: string | null;
   strokeCounts: Record<string, number>;
-  exploded: boolean;
+  exploding: boolean;
 }>();
 
 defineEmits<{
@@ -114,7 +201,48 @@ defineEmits<{
   "save-pose": [];
   "apply-pose": [poseId: string];
   "remove-pose": [poseId: string];
+  "toggle-ik": [];
+  "reset-articulation": [];
+  "select-joint": [jointId: string];
+  "edit-joint": [jointId: string];
+  "delete-joint": [jointId: string];
+  "new-joint": [];
+  "arm-dof": [dof: JointDofName];
+  "toggle-mirror": [];
 }>();
+
+const DOF_LABELS: Record<JointDofName, string> = {
+  translation: "Slide",
+  twist: "Twist",
+  swingU: "Swing U",
+  swingV: "Swing V",
+};
+
+const toDegrees = (radians: number) => (radians * 180) / Math.PI;
+
+const dofValueLabel = (dof: JointDofName, value: number) =>
+  dof === "translation" ? value.toFixed(2) : `${toDegrees(value).toFixed(0)}°`;
+
+/** Current values of the unlocked DoFs, compact. */
+function jointValueLabel(joint: Joint): string {
+  const parts = JOINT_DOF_NAMES.filter((d) => dofUnlocked(joint.dofs[d])).map(
+    (d) => dofValueLabel(d, joint.dofs[d].value),
+  );
+  return parts.join(" ");
+}
+
+function dofRangeLabel(joint: Joint, dof: JointDofName): string {
+  const [min, max] = joint.dofs[dof].range;
+  if (min === 0 && max === 0) return "locked";
+  return `${dofValueLabel(dof, min)} .. ${dofValueLabel(dof, max)}`;
+}
+
+function jointTooltip(joint: Joint): string {
+  const ranges = JOINT_DOF_NAMES.filter((d) => dofUnlocked(joint.dofs[d]))
+    .map((d) => `${DOF_LABELS[d]} ${dofRangeLabel(joint, d)}`)
+    .join(", ");
+  return `${jointKindLabel(joint)} joint${ranges ? ` — ${ranges}` : ""}. Click to drive it (Articulate tool); ✎ edits it.`;
+}
 
 const panels: PanelName[] = ["articulations", "poses", "parts"];
 const panelLabels: Record<PanelName, string> = {
@@ -125,7 +253,8 @@ const panelLabels: Record<PanelName, string> = {
 const headerTooltips: Record<PanelName, string> = {
   parts: "Part segmentation — group strokes into parts with the Segment tool",
   poses: "Saved poses — snapshots of every stroke's placement",
-  articulations: "Joints between parts (coming later)",
+  articulations:
+    "Joints between parts — articulate them with the Articulate tool (A), toggle IK here",
 };
 </script>
 
@@ -287,5 +416,51 @@ const headerTooltips: Record<PanelName, string> = {
   position: absolute;
   top: 4px;
   right: 4px;
+}
+
+.panel-actions button.active {
+  background: #ffd16b;
+}
+
+.dof-row {
+  margin-left: 16px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  font-size: 0.9em;
+}
+
+.dof-row .row-label {
+  font-weight: 700;
+}
+
+.recording {
+  color: #d03030;
+}
+
+.mirror-toggle {
+  gap: 6px;
+  font-weight: 700;
+}
+
+.count.value {
+  min-width: 38px;
+  text-align: right;
+}
+
+.ik-toggle {
+  flex: 1;
+  height: 32px;
+  border-radius: 16px;
+  background: #eeeeee;
+  font-weight: 900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.ik-toggle:hover {
+  background: #ffe8b3;
 }
 </style>

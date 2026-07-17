@@ -1,12 +1,15 @@
 import type {
   FillStyle,
+  Joint,
   Part,
   Pose,
   Stroke,
   StrokeStyle,
   SurfaceShape,
   Transform,
+  Vec3,
 } from "./types";
+import { lockedDofs } from "./types";
 import { SketchDocument } from "./SketchDocument";
 
 // Versioned on-disk format. Typed arrays become plain number arrays in JSON;
@@ -14,8 +17,41 @@ import { SketchDocument } from "./SketchDocument";
 
 export const FORMAT_NAME = "interactive-arti-design";
 // 1 = legacy Penzil (see legacyPenzil.ts); 2 = strokes only;
-// 3 = adds parts, poses, exploded state
-export const FORMAT_VERSION = 3;
+// 3 = adds parts, poses, exploded state; 4 = adds typed joints;
+// 5 = joints become screws (per-DoF ranges/values instead of a type)
+export const FORMAT_VERSION = 5;
+
+/** Version-4 joint shape, kept for migration. */
+interface JointJsonV4 {
+  id: string;
+  name: string;
+  parentPartId: string;
+  childPartId: string;
+  type: "fixed" | "revolute" | "prismatic";
+  pivot: Vec3;
+  axis: Vec3;
+  range: [number, number];
+  value: number;
+}
+
+function migrateJoint(json: Joint | JointJsonV4): Joint {
+  if (!("type" in json)) return json;
+  const dofs = lockedDofs();
+  if (json.type === "revolute") {
+    dofs.twist = { range: [...json.range], value: json.value };
+  } else if (json.type === "prismatic") {
+    dofs.translation = { range: [...json.range], value: json.value };
+  }
+  return {
+    id: json.id,
+    name: json.name,
+    parentPartId: json.parentPartId,
+    childPartId: json.childPartId,
+    pivot: json.pivot,
+    axis: json.axis,
+    dofs,
+  };
+}
 
 interface StrokeJson {
   id: string;
@@ -36,6 +72,8 @@ export interface DocumentJson {
   parts?: Part[];
   poses?: Pose[];
   exploded?: boolean;
+  /** Since version 4; version-5 screw shape or version-4 typed shape. */
+  joints?: (Joint | JointJsonV4)[];
 }
 
 export function serializeDocument(doc: SketchDocument): DocumentJson {
@@ -44,6 +82,7 @@ export function serializeDocument(doc: SketchDocument): DocumentJson {
     version: FORMAT_VERSION,
     parts: doc.allParts(),
     poses: doc.allPoses(),
+    joints: doc.allJoints(),
     exploded: doc.exploded,
     strokes: doc.allStrokes().map((s) => ({
       id: s.id,
@@ -69,6 +108,7 @@ export function deserializeDocument(json: unknown): SketchDocument {
   const doc = new SketchDocument();
   for (const part of data.parts ?? []) doc.addPart(part);
   for (const pose of data.poses ?? []) doc.addPose(pose);
+  for (const joint of data.joints ?? []) doc.addJoint(migrateJoint(joint));
   doc.exploded = data.exploded ?? false;
   for (const s of data.strokes) {
     const stroke: Stroke = {

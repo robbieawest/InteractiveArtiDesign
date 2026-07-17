@@ -1,5 +1,5 @@
-import type { Part, Pose, Stroke, Transform, Vec3 } from "./types";
-import { cloneTransform } from "./types";
+import type { Joint, JointDofName, Part, Pose, Stroke, Transform, Vec3 } from "./types";
+import { cloneJoint, cloneTransform } from "./types";
 
 export type DocumentEvent =
   | { type: "strokeAdded"; stroke: Stroke }
@@ -7,6 +7,7 @@ export type DocumentEvent =
   | { type: "strokeChanged"; stroke: Stroke }
   | { type: "partsChanged" }
   | { type: "posesChanged" }
+  | { type: "jointsChanged" }
   | { type: "cleared" };
 
 export type DocumentListener = (event: DocumentEvent) => void;
@@ -21,6 +22,7 @@ export class SketchDocument {
   private strokes = new Map<string, Stroke>();
   private parts = new Map<string, Part>();
   private poses = new Map<string, Pose>();
+  private joints = new Map<string, Joint>();
   /** True while parts are pushed apart; offsets live on the parts. */
   exploded = false;
   private listeners = new Set<DocumentListener>();
@@ -90,6 +92,15 @@ export class SketchDocument {
         this.emit({ type: "strokeChanged", stroke });
       }
     }
+    // joints are edges between parts; they can't outlive an endpoint
+    let jointsRemoved = false;
+    for (const joint of [...this.joints.values()]) {
+      if (joint.parentPartId === id || joint.childPartId === id) {
+        this.joints.delete(joint.id);
+        jointsRemoved = true;
+      }
+    }
+    if (jointsRemoved) this.emit({ type: "jointsChanged" });
     this.emit({ type: "partsChanged" });
   }
 
@@ -128,6 +139,42 @@ export class SketchDocument {
     this.emit({ type: "partsChanged" });
   }
 
+  // --- joints ---
+
+  getJoint(id: string): Joint | undefined {
+    return this.joints.get(id);
+  }
+
+  allJoints(): Joint[] {
+    return [...this.joints.values()];
+  }
+
+  addJoint(joint: Joint): void {
+    if (this.joints.has(joint.id)) {
+      throw new Error(`duplicate joint id: ${joint.id}`);
+    }
+    this.joints.set(joint.id, joint);
+    this.emit({ type: "jointsChanged" });
+  }
+
+  removeJoint(id: string): void {
+    if (this.joints.delete(id)) this.emit({ type: "jointsChanged" });
+  }
+
+  setJointValue(id: string, dof: JointDofName, value: number): void {
+    const joint = this.joints.get(id);
+    if (!joint) throw new Error(`no such joint: ${id}`);
+    joint.dofs[dof].value = value;
+    this.emit({ type: "jointsChanged" });
+  }
+
+  /** Overwrite a joint's definition (pivot, axis, ranges…) in place. */
+  replaceJoint(joint: Joint): void {
+    if (!this.joints.has(joint.id)) throw new Error(`no such joint: ${joint.id}`);
+    this.joints.set(joint.id, cloneJoint(joint));
+    this.emit({ type: "jointsChanged" });
+  }
+
   // --- poses ---
 
   getPose(id: string): Pose | undefined {
@@ -152,6 +199,7 @@ export class SketchDocument {
     this.strokes.clear();
     this.parts.clear();
     this.poses.clear();
+    this.joints.clear();
     this.exploded = false;
     this.emit({ type: "cleared" });
   }
