@@ -2,7 +2,6 @@ import * as THREE from "three";
 import type { SketchDocument } from "../core/SketchDocument";
 import type { UndoStack } from "../core/undo";
 import {
-  collapseCommand,
   explodeStateCommand,
   type PartOffsetChange,
   type StrokeTransformChange,
@@ -19,12 +18,13 @@ const MAX_FACTOR = 4;
 const DRAG_FRACTION = 0.2;
 
 /**
- * Drag-to-explode: while active, left-dragging away from the model's center
- * pushes every part outward along its explode direction; dragging back in
- * reduces the spread, but never past the original pose (the factor is
- * clamped to [0, MAX_FACTOR] — no imploding). Each drag is one undoable
- * command; deactivating the tool collapses everything back to the original
- * pose exactly, including strokes added to parts while exploded.
+ * Drag-to-explode: while attached (explode mode on, no other tool active),
+ * left-dragging away from the model's center pushes every part outward
+ * along its explode direction; dragging back in reduces the spread, but
+ * never past the original pose (the factor is clamped to [0, MAX_FACTOR] —
+ * no imploding). Each drag is one undoable command. Detaching keeps the
+ * exploded layout so other tools can work on it; only turning explode mode
+ * off (in the Parts panel) collapses back to the original pose.
  */
 export class ExplodeTool {
   /** Per-part outward offset at factor 1, computed from the rest pose. */
@@ -47,11 +47,6 @@ export class ExplodeTool {
   ) {}
 
   attach(): void {
-    // a document loaded mid-explosion starts from its original pose so the
-    // explode directions are computed at rest
-    if (this.doc.allParts().some((p) => p.explodeOffset)) {
-      this.undo.push(collapseCommand(this.doc));
-    }
     const layout = computeExplodeLayout(this.doc);
     this.baseOffsets = layout.offsets;
     this.center = layout.center;
@@ -69,12 +64,16 @@ export class ExplodeTool {
     dom.removeEventListener("pointerup", this.onPointerUp);
     dom.removeEventListener("pointercancel", this.onPointerUp);
     if (this.dragging) this.endDrag();
-    // turning explode off reverts to the original pose
-    if (this.doc.allParts().some((p) => p.explodeOffset)) {
-      this.undo.push(collapseCommand(this.doc));
-    }
     this.baseOffsets.clear();
-    this.viewport.invalidate();
+  }
+
+  /** Jump straight to `factor` as one undoable adjustment — used for the
+   *  small initial spread when explode mode is turned on. */
+  setFactor(factor: number): void {
+    if (this.baseOffsets.size === 0) return;
+    this.beginAdjust();
+    this.applyFactor(Math.min(Math.max(factor, 0), MAX_FACTOR));
+    this.endDrag();
   }
 
   private onPointerDown = (event: PointerEvent): void => {
@@ -82,11 +81,16 @@ export class ExplodeTool {
     if (this.baseOffsets.size === 0) return;
     this.dragging = true;
     this.viewport.renderer.domElement.setPointerCapture(event.pointerId);
+    this.startDistance = this.cursorDistance(event);
+    this.beginAdjust();
+  };
+
+  /** Capture the baselines one adjustment (drag or jump) re-derives from. */
+  private beginAdjust(): void {
     // derive the factor from the stored offsets so undo/redo between drags
     // can't leave the tool out of sync with the document
     this.startFactor = this.currentFactor();
     this.factor = this.startFactor;
-    this.startDistance = this.cursorDistance(event);
 
     this.baselineTransforms.clear();
     this.strokeParts.clear();
@@ -99,7 +103,7 @@ export class ExplodeTool {
         this.strokeParts.set(stroke.id, partId);
       }
     }
-  };
+  }
 
   private onPointerMove = (event: PointerEvent): void => {
     if (!this.dragging) return;

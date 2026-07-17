@@ -13,6 +13,10 @@ export interface ExplodeLayout {
  * direction from the sketch's overall center to the part's own center
  * (stroke pivots averaged), by a distance proportional to the sketch's
  * spread so small and large sketches both separate visibly.
+ *
+ * Centers are taken at the rest pose (stored explode offsets subtracted),
+ * so the layout is the same whether the document is currently exploded or
+ * not.
  */
 export function computeExplodeLayout(doc: SketchDocument): ExplodeLayout {
   const centers = new Map<string, Vec3>();
@@ -25,10 +29,11 @@ export function computeExplodeLayout(doc: SketchDocument): ExplodeLayout {
       c.y += s.transform.position.y;
       c.z += s.transform.position.z;
     }
+    const offset = part.explodeOffset ?? { x: 0, y: 0, z: 0 };
     centers.set(part.id, {
-      x: c.x / strokes.length,
-      y: c.y / strokes.length,
-      z: c.z / strokes.length,
+      x: c.x / strokes.length - offset.x,
+      y: c.y / strokes.length - offset.y,
+      z: c.z / strokes.length - offset.z,
     });
   }
   if (centers.size === 0) {

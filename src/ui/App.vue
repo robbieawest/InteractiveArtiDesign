@@ -5,42 +5,42 @@
     <button
       :class="{ active: activeTool === 'draw' }"
       title="Draw (D) — left-drag on the canvas surface to sketch"
-      @click="setTool('draw')"
+      @click="toggleTool('draw')"
     >
       Draw
     </button>
     <button
       :class="{ active: activeTool === 'erase' }"
       title="Erase (E) — left-drag over strokes to delete them"
-      @click="setTool('erase')"
+      @click="toggleTool('erase')"
     >
       Erase
     </button>
     <button
       :class="{ active: activeTool === 'select' }"
       title="Select (V) — click a stroke, double-click a part; T/R/S set the gizmo, Delete removes, Esc deselects"
-      @click="setTool('select')"
+      @click="toggleTool('select')"
     >
       Select
     </button>
     <button
       :class="{ active: activeTool === 'segment' }"
       title="Segment (G) — drag a pen through strokes to add/remove them from the active part (see Parts panel)"
-      @click="setTool('segment')"
+      @click="toggleTool('segment')"
     >
       Segment
     </button>
     <button
       :class="{ active: activeTool === 'articulate' }"
       title="Articulate (A) — click a part to drive its joint along its axis; toggle IK in the Articulations panel to drag parts freely (collapse the exploded view first)"
-      @click="setTool('articulate')"
+      @click="toggleTool('articulate')"
     >
       Articulate
     </button>
     <button
       :class="{ active: activeTool === 'joint' }"
       title="Joint (J) — drag from a parent part to a child part to create a joint; click a part to edit the joint that drives it"
-      @click="setTool('joint')"
+      @click="toggleTool('joint')"
     >
       Joint
     </button>
@@ -130,10 +130,11 @@
     <template v-else-if="activeTool === 'joint'">
       <span class="hint">{{ jointHint }}</span>
     </template>
-    <template v-else-if="activeTool === 'explode'">
+    <template v-else-if="activeTool === 'none' && explodeMode">
       <span class="hint">
-        Drag away from the model's center to explode it; turn explode off in
-        the Parts panel to restore the original pose
+        Drag away from the model's center to explode it; other tools work on
+        the exploded model — turn explode off in the Parts panel to restore
+        the original pose
       </span>
     </template>
     <template v-else-if="activeTool === 'segment'">
@@ -200,7 +201,7 @@
     :mirror="mirrorRange"
     :active-part-id="activePartId"
     :stroke-counts="strokeCounts"
-    :exploding="activeTool === 'explode'"
+    :exploding="explodeMode"
     @set-expanded="expandedPanel = $event"
     @set-active-part="setActivePart"
     @add-part="addPart"
@@ -259,6 +260,7 @@ import { SketchDocument } from "../core/SketchDocument";
 import {
   UndoStack,
   applyPoseCommand,
+  collapseCommand,
   resetArticulationCommand,
 } from "../core/undo";
 import { deserializeDocument, serializeDocument } from "../core/serialization";
@@ -267,14 +269,16 @@ import { importSketchLabGltf, parseGlb } from "../engine/importSketchLab";
 import type { JointDofName, SurfaceShape } from "../core/types";
 import { jointPosed } from "../core/types";
 
+/** "none" is the default idle state: no tool listens to the pointer —
+ *  except in explode mode, where idle dragging adjusts the explosion. */
 type ToolName =
+  | "none"
   | "draw"
   | "erase"
   | "select"
   | "segment"
   | "articulate"
-  | "joint"
-  | "explode";
+  | "joint";
 
 const viewportEl = useTemplateRef("viewportEl");
 const doc = new SketchDocument();
@@ -283,7 +287,14 @@ const undoStack = new UndoStack();
 let viewport: Viewport | undefined;
 let strokeRenderer: StrokeRenderer | undefined;
 let surface: CanvasSurface | undefined;
-let tools: Record<ToolName, { attach(): void; detach(): void }> | undefined;
+interface ToolHandler {
+  attach(): void;
+  detach(): void;
+}
+let tools: Record<Exclude<ToolName, "none">, ToolHandler> | undefined;
+/** The handler currently receiving pointer events (null in the idle state). */
+let attachedHandler: ToolHandler | null = null;
+let explodeTool: ExplodeTool | undefined;
 let drawTool: DrawTool | undefined;
 let selectTool: SelectTool | undefined;
 let segmentTool: SegmentTool | undefined;
@@ -291,7 +302,10 @@ let articulateTool: ArticulateTool | undefined;
 let jointTool: JointTool | undefined;
 let jointLines: JointLines | undefined;
 
-const activeTool = ref<ToolName>("draw");
+const activeTool = ref<ToolName>("none");
+/** Explode mode persists across tool switches so you can draw, select, etc.
+ *  on the exploded model; turning it off restores the original pose. */
+const explodeMode = ref(false);
 const shape = ref<SurfaceShape>("plane");
 const gizmoMode = ref<GizmoMode>("translate");
 const canvasVisible = ref(true);
@@ -371,6 +385,7 @@ onMounted(() => {
     mirrorRange.value = state.mirror;
   };
   jointLines = new JointLines(doc, viewport);
+  explodeTool = new ExplodeTool(viewport, doc, undoStack);
   tools = {
     draw: drawTool,
     erase: new EraseTool(viewport, doc, undoStack, strokeRenderer),
@@ -378,9 +393,8 @@ onMounted(() => {
     segment: segmentTool,
     articulate: articulateTool,
     joint: jointTool,
-    explode: new ExplodeTool(viewport, doc, undoStack),
   };
-  tools[activeTool.value].attach();
+  activate(activeTool.value);
 
   // gizmos get out of the way while the camera is being driven
   viewport.onCameraActivity((active) => {
@@ -395,7 +409,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener("keydown", onKeyDown);
-  tools?.[activeTool.value].detach();
+  attachedHandler?.detach();
+  attachedHandler = null;
   jointLines?.dispose();
   surface?.dispose();
   strokeRenderer?.dispose();
@@ -422,6 +437,15 @@ watch([activeTool, selectedPart, docVersion], () => {
   }
 });
 watch(mirror, (value) => drawTool && (drawTool.mirrorAxis = value));
+// undo/redo can re-explode the document while the mode toggle is off; pick
+// the mode back up so the panel button and idle drag stay truthful (never
+// the reverse: mode-on-at-factor-0 is a valid state)
+watch(docVersion, () => {
+  if (doc.exploded && !explodeMode.value) {
+    explodeMode.value = true;
+    if (activeTool.value === "none") activate("none");
+  }
+});
 watch(ikEnabled, (value) => articulateTool?.setIkMode(value));
 watch(segmentMode, (value) => segmentTool && (segmentTool.mode = value));
 watch([strokeColor, strokeWidth], ([color, width]) => {
@@ -437,19 +461,23 @@ watch([fillVisible, fillColor], ([visible, color]) => {
   }
 });
 
-function setTool(tool: ToolName): void {
-  if (!tools || tool === activeTool.value) return;
-  tools[activeTool.value].detach();
+function activate(tool: ToolName): void {
+  if (!tools) return;
+  attachedHandler?.detach();
   strokeRenderer?.clearHighlights(); // each tool re-applies its own
   activeTool.value = tool;
-  tools[tool].attach();
+  attachedHandler =
+    tool === "none"
+      ? explodeMode.value
+        ? (explodeTool ?? null)
+        : null
+      : tools[tool];
+  attachedHandler?.attach();
   // the canvas surface only participates in drawing; elsewhere it would
   // obstruct clicks on strokes
   surface?.setVisible(tool === "draw" && canvasVisible.value);
 
-  if (tool === "explode") {
-    expandedPanel.value = "parts";
-  } else if (tool === "joint") {
+  if (tool === "joint" || tool === "articulate") {
     expandedPanel.value = "articulations";
   } else if (tool === "segment") {
     // segmentation needs a target part: create one if none exists yet, and
@@ -460,9 +488,18 @@ function setTool(tool: ToolName): void {
       segmentTool?.setActivePart(activePartId.value);
     }
     expandedPanel.value = "parts";
-  } else if (tool === "articulate") {
-    expandedPanel.value = "articulations";
   }
+}
+
+/** Explicit switch (panel actions etc.) — never toggles off. */
+function setTool(tool: ToolName): void {
+  if (tool !== activeTool.value) activate(tool);
+}
+
+/** Toolbar buttons and keybinds: picking the active tool again turns it
+ *  off, back to the idle state. */
+function toggleTool(tool: ToolName): void {
+  activate(tool === activeTool.value ? "none" : tool);
 }
 
 function resetArticulation(): void {
@@ -527,9 +564,21 @@ function removePart(partId: string): void {
 }
 
 function toggleExplode(): void {
-  // turning the tool off (or switching to any other tool) collapses the
-  // parts back to their original pose
-  setTool(activeTool.value === "explode" ? "select" : "explode");
+  if (explodeMode.value) {
+    explodeMode.value = false;
+    // drop the drag handler if it was attached, then restore the pose
+    if (activeTool.value === "none") activate("none");
+    if (doc.allParts().some((p) => p.explodeOffset)) {
+      undoStack.push(collapseCommand(doc));
+    }
+  } else {
+    explodeMode.value = true;
+    // enter the idle state, where dragging adjusts the explosion
+    activate("none");
+    // start with a small spread so toggling visibly does something
+    if (!doc.exploded) explodeTool?.setFactor(0.5);
+    expandedPanel.value = "parts";
+  }
 }
 
 function selectJoint(jointId: string): void {
@@ -598,12 +647,12 @@ function onKeyDown(event: KeyboardEvent): void {
   else if (event.code === "KeyT") setGizmoMode("translate");
   else if (event.code === "KeyR") setGizmoMode("rotate");
   else if (event.code === "KeyS") setGizmoMode("scale");
-  else if (event.code === "KeyD") setTool("draw");
-  else if (event.code === "KeyE") setTool("erase");
-  else if (event.code === "KeyV") setTool("select");
-  else if (event.code === "KeyG") setTool("segment");
-  else if (event.code === "KeyA") setTool("articulate");
-  else if (event.code === "KeyJ") setTool("joint");
+  else if (event.code === "KeyD") toggleTool("draw");
+  else if (event.code === "KeyE") toggleTool("erase");
+  else if (event.code === "KeyV") toggleTool("select");
+  else if (event.code === "KeyG") toggleTool("segment");
+  else if (event.code === "KeyA") toggleTool("articulate");
+  else if (event.code === "KeyJ") toggleTool("joint");
 }
 
 function resetStrokes(): void {
@@ -614,6 +663,15 @@ function resetStrokes(): void {
   segmentTool?.setActivePart(undefined);
   partCounter = 0;
   resetDialogOpen.value = false;
+  syncExplodeMode();
+}
+
+/** Align explode mode with the (re)loaded document's exploded state. */
+function syncExplodeMode(): void {
+  if (explodeMode.value !== doc.exploded) {
+    explodeMode.value = doc.exploded;
+    if (activeTool.value === "none") activate("none");
+  }
 }
 
 function saveThenReset(): void {
@@ -685,6 +743,7 @@ function loadFile(): void {
         for (const stroke of imported.strokes) doc.addStroke(stroke);
         for (const joint of imported.joints) doc.addJoint(joint);
         partCounter = imported.parts.length;
+        syncExplodeMode();
         return;
       }
 
@@ -704,6 +763,7 @@ function loadFile(): void {
         for (const stroke of loaded.allStrokes()) doc.addStroke(stroke);
         partCounter = loaded.allParts().length;
       }
+      syncExplodeMode();
     } catch (error) {
       alert(`Could not load file: ${error}`);
     }

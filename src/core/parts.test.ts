@@ -189,6 +189,14 @@ describe("explode / collapse", () => {
     const base = computeExplodeLayout(doc).offsets;
     undo.push(explodeTo(doc, base, 1));
     const once = doc.getStroke(a.id)!.transform.position.x;
+    // the layout is rest-based: asking again while exploded gives the same
+    // base offsets (explode mode persists across tool switches, so the tool
+    // recomputes them from an already-exploded document)
+    for (const [partId, offset] of computeExplodeLayout(doc).offsets) {
+      expect(offset.x).toBeCloseTo(base.get(partId)!.x);
+      expect(offset.y).toBeCloseTo(base.get(partId)!.y);
+      expect(offset.z).toBeCloseTo(base.get(partId)!.z);
+    }
     undo.push(explodeTo(doc, base, 2));
     // twice the spread relative to rest, not relative to the first explode
     expect(doc.getStroke(a.id)!.transform.position.x).toBeCloseTo(

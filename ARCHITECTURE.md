@@ -56,12 +56,14 @@ alt+drag = orbit.
    - **Posing** — multi-select in `tools/SelectTool.ts` (double-click =
      part) with one pivot gizmo; named pose snapshots with viewport
      thumbnails, saved in the document. (done)
-   - **Exploded view** — a drag tool (`tools/ExplodeTool.ts`) toggled from
-     the Parts panel: dragging away from the model center scales per-part
-     outward offsets (`core/explode.ts`) by a factor clamped to [0, 4] —
-     it never goes past the original pose. Offsets are stored on the parts;
-     turning the tool off collapses exactly, including strokes segmented
-     while exploded. (done)
+   - **Exploded view** — a persistent mode toggled from the Parts panel:
+     in the idle no-tool state, dragging away from the model center
+     (`tools/ExplodeTool.ts`) scales per-part outward offsets
+     (`core/explode.ts`, always computed at the rest pose) by a factor
+     clamped to [0, 4] — it never goes past the original pose. Offsets are
+     stored on the parts; the mode survives tool switches so drawing,
+     selecting, and segmenting work on the exploded model. Turning the mode
+     off collapses exactly, including strokes added while exploded. (done)
    - **SketchLab import** — `engine/importSketchLab.ts` loads glTF/GLB
      exports of SketchLab documents (e.g. `SampleModels/`): stroke
      centerlines are recovered from the triangular tube meshes

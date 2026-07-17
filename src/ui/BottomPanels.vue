@@ -33,8 +33,8 @@
               :class="{ active: exploding }"
               :title="
                 exploding
-                  ? 'Turn the explode tool off — every part returns to its original placement'
-                  : 'Explode tool — left-drag away from the model center to spread the parts apart'
+                  ? 'Turn explode off — every part returns to its original placement'
+                  : 'Explode — with no tool active, left-drag away from the model center to spread the parts apart; other tools keep working on the exploded model'
               "
               @click="$emit('toggle-explode')"
             >
