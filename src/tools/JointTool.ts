@@ -10,7 +10,13 @@ import {
   updateJointCommand,
 } from "../core/undo";
 import type { Joint, JointDofName, Transform, Vec3 } from "../core/types";
-import { cloneJoint, cloneTransform, jointPosed, lockedDofs } from "../core/types";
+import {
+  JOINT_DOF_NAMES,
+  cloneJoint,
+  cloneTransform,
+  jointPosed,
+  lockedDofs,
+} from "../core/types";
 import {
   computePartDeltas,
   partsInSubtree,
@@ -26,6 +32,7 @@ import {
 import type { Viewport } from "../engine/Viewport";
 import type { StrokeRenderer } from "../engine/StrokeRenderer";
 import { pickStrokeAtCursor } from "../engine/picking";
+import { dofRangeVisual } from "../engine/jointRangeVisual";
 import { posedJointFrame, twistAbout } from "./ArticulateTool";
 
 export interface JointToolState {
@@ -74,6 +81,9 @@ export class JointTool {
   private downPos = new THREE.Vector2();
 
   private proxy?: THREE.Group;
+  /** Range fills, fixed at the rest frame so they hold still while the
+   *  child part moves during a demonstration. */
+  private rangeGroup?: THREE.Group;
   private controls?: TransformControls;
   private pivotMode: "translate" | "rotate" = "translate";
   private dragging = false;
@@ -390,6 +400,12 @@ export class JointTool {
     this.proxy.add(...axisVisual(this.axisLength(joint)));
     this.viewport.scene.add(this.proxy);
 
+    this.rangeGroup = new THREE.Group();
+    this.rangeGroup.position.copy(this.proxy.position);
+    this.rangeGroup.quaternion.copy(this.proxy.quaternion);
+    this.viewport.scene.add(this.rangeGroup);
+    this.refreshRangeVisuals();
+
     this.controls = new TransformControls(
       this.viewport.camera,
       this.viewport.renderer.domElement,
@@ -446,6 +462,40 @@ export class JointTool {
       });
       this.proxy = undefined;
     }
+    if (this.rangeGroup) {
+      this.clearRangeVisuals();
+      this.viewport.scene.remove(this.rangeGroup);
+      this.rangeGroup = undefined;
+    }
+  }
+
+  private clearRangeVisuals(): void {
+    if (!this.rangeGroup) return;
+    for (const child of [...this.rangeGroup.children]) {
+      this.rangeGroup.remove(child);
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+    }
+  }
+
+  /** Rebuild the range fills: while a DoF is armed only that DoF shows
+   *  (`preview` overrides its stored range mid-demonstration); otherwise
+   *  every unlocked DoF's committed range shows. */
+  private refreshRangeVisuals(preview?: [number, number]): void {
+    const joint = this.jointId ? this.doc.getJoint(this.jointId) : undefined;
+    if (!this.rangeGroup || !joint) return;
+    this.clearRangeVisuals();
+    const length = this.axisLength(joint);
+    const dofs = this.armedDof ? [this.armedDof] : JOINT_DOF_NAMES;
+    for (const dof of dofs) {
+      const range =
+        preview && dof === this.armedDof ? preview : joint.dofs[dof].range;
+      const mesh = dofRangeVisual(dof, range, length);
+      if (mesh) this.rangeGroup.add(mesh);
+    }
+    this.viewport.invalidate();
   }
 
   /** Axis visual length, scaled to the child part's size. */
@@ -486,7 +536,14 @@ export class JointTool {
 
   private onGizmoChange(): void {
     if (!this.dragging || !this.proxy) return;
-    if (!this.armedDof) return; // axis placement commits at release
+    if (!this.armedDof) {
+      // axis placement commits at release; the range fills ride along
+      if (this.rangeGroup) {
+        this.rangeGroup.position.copy(this.proxy.position);
+        this.rangeGroup.quaternion.copy(this.proxy.quaternion);
+      }
+      return;
+    }
     const joint = this.doc.getJoint(this.jointId!);
     if (!joint) return;
 
@@ -503,7 +560,17 @@ export class JointTool {
     }
     this.sessionMin = Math.min(this.sessionMin, raw);
     this.sessionMax = Math.max(this.sessionMax, raw);
+    this.refreshRangeVisuals(this.sessionRange());
     this.applyDemoValue(joint, this.armedDof, raw);
+  }
+
+  /** The range this demonstration session would commit right now. */
+  private sessionRange(): [number, number] {
+    if (this.mirror) {
+      const extreme = Math.max(-this.sessionMin, this.sessionMax);
+      return [-extreme, extreme];
+    }
+    return [Math.min(0, this.sessionMin), Math.max(0, this.sessionMax)];
   }
 
   /** Move the child subtree live during a demonstration (unclamped). */
@@ -542,10 +609,7 @@ export class JointTool {
       this.doc.setJointValue(joint.id, this.armedDof, 0);
       this.baselineTransforms.clear();
 
-      const extreme = Math.max(-this.sessionMin, this.sessionMax);
-      const range: [number, number] = this.mirror
-        ? [-extreme, extreme]
-        : [Math.min(0, this.sessionMin), Math.max(0, this.sessionMax)];
+      const range = this.sessionRange();
       const before = cloneJoint(joint);
       const after = cloneJoint(joint);
       after.dofs[this.armedDof].range = range;

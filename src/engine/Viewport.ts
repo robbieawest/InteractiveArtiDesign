@@ -53,13 +53,12 @@ export class Viewport {
     const backgroundColor = 0xdddddd;
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(backgroundColor);
-    this.scene.fog = new THREE.Fog(backgroundColor, 10, 25);
 
     this.camera = new THREE.PerspectiveCamera(
       100,
       container.clientWidth / Math.max(container.clientHeight, 1),
       0.1,
-      1000,
+      5000,
     );
     this.camera.position.set(5, 5, 10);
     this.camera.zoom = 3;
@@ -74,7 +73,7 @@ export class Viewport {
     this.controls.dampingFactor = 20;
     this.controls.draggingDampingFactor = 200;
     this.controls.minDistance = 0.5;
-    this.controls.maxDistance = 100;
+    this.controls.maxDistance = 2000;
     this.controls.mouseButtons.left = CameraControls.ACTION.NONE;
     this.controls.mouseButtons.wheel = CameraControls.ACTION.DOLLY;
     this.controls.mouseButtons.middle = CameraControls.ACTION.TRUCK;

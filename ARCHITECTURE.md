@@ -106,7 +106,10 @@ alt+drag = orbit.
      U/V derive from the axis). Ranges are *demonstrated*: arm a DoF in
      the Articulations panel and drag the child through the motion — the
      extremes reached become the range (mirror toggle symmetrizes); on
-     release the part snaps back to rest. The tool always works at the
-     rest pose (posed joints are zeroed first, undoably).
+     release the part snaps back to rest. Ranges are visualized as
+     translucent fills (`engine/jointRangeVisual.ts`): pie sectors in each
+     rotational DoF's sweep plane and a bar along the axis for slide, live
+     while demonstrating, committed ranges otherwise. The tool always works
+     at the rest pose (posed joints are zeroed first, undoably).
      `engine/JointLines.ts` draws parent↔child lines while exploded. (done)
    - Articulation discovery, skinning: not yet.
