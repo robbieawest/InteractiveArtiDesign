@@ -1,0 +1,3 @@
+[submodule "surfacing-server/methods/vns"]
+	path = surfacing-server/methods/vns
+	url = https://github.com/robbieawest/Variational-Neural-Surfacing-of-3D-Sketches.git
