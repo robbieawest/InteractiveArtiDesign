@@ -202,6 +202,11 @@
     :active-part-id="activePartId"
     :stroke-counts="strokeCounts"
     :exploding="explodeMode"
+    :methods="surfacingMethods"
+    :surfacing-method="surfacingMethod"
+    :surfacing="surfacingBusy"
+    :surfacing-progress="surfacingProgress"
+    :has-surface="hasSurface"
     @set-expanded="expandedPanel = $event"
     @set-active-part="setActivePart"
     @add-part="addPart"
@@ -218,6 +223,9 @@
     @new-joint="newJoint"
     @arm-dof="jointTool?.armDof($event)"
     @toggle-mirror="jointTool?.setMirror(!mirrorRange)"
+    @set-surfacing-method="surfacingMethod = $event"
+    @surface="runSurfacing"
+    @clear-surface="clearSurface"
   />
 
   <div
@@ -266,6 +274,12 @@ import {
 import { deserializeDocument, serializeDocument } from "../core/serialization";
 import { importLegacyPenzil, isLegacyPenzilJson } from "../core/legacyPenzil";
 import { importSketchLabGltf, parseGlb } from "../engine/importSketchLab";
+import { SurfacePreview } from "../engine/SurfacePreview";
+import {
+  buildSurfacingSketch,
+  fetchMethods,
+  surfaceSketch,
+} from "../surfacing/client";
 import type { JointDofName, SurfaceShape } from "../core/types";
 import { jointPosed } from "../core/types";
 
@@ -301,6 +315,7 @@ let segmentTool: SegmentTool | undefined;
 let articulateTool: ArticulateTool | undefined;
 let jointTool: JointTool | undefined;
 let jointLines: JointLines | undefined;
+let surfacePreview: SurfacePreview | undefined;
 
 const activeTool = ref<ToolName>("none");
 /** Explode mode persists across tool switches so you can draw, select, etc.
@@ -317,6 +332,14 @@ const fillColor = ref("#1c1c1e");
 const canUndo = ref(false);
 const canRedo = ref(false);
 const resetDialogOpen = ref(false);
+
+// surfacing job state (the mesh itself lives in SurfacePreview, not here)
+const surfacingBusy = ref(false);
+const surfacingProgress = ref(0);
+const hasSurface = ref(false);
+/** Adapter names from the server; empty while it is unreachable. */
+const surfacingMethods = ref<string[]>([]);
+const surfacingMethod = ref("");
 
 // parts / poses / panels
 const expandedPanel = ref<PanelName | null>(null);
@@ -386,6 +409,7 @@ onMounted(() => {
   };
   jointLines = new JointLines(doc, viewport);
   explodeTool = new ExplodeTool(viewport, doc, undoStack);
+  surfacePreview = new SurfacePreview(viewport);
   tools = {
     draw: drawTool,
     erase: new EraseTool(viewport, doc, undoStack, strokeRenderer),
@@ -405,12 +429,14 @@ onMounted(() => {
   });
 
   window.addEventListener("keydown", onKeyDown);
+  void refreshSurfacingMethods();
 });
 
 onUnmounted(() => {
   window.removeEventListener("keydown", onKeyDown);
   attachedHandler?.detach();
   attachedHandler = null;
+  surfacePreview?.dispose();
   jointLines?.dispose();
   surface?.dispose();
   strokeRenderer?.dispose();
@@ -610,6 +636,47 @@ function savePose(): void {
 function applyPose(poseId: string): void {
   const pose = doc.getPose(poseId);
   if (pose) undoStack.push(applyPoseCommand(doc, pose));
+}
+
+/** Ask the server which methods it offers; empty list = offline, which the
+ *  Surfacer panel reports. Called when the panel opens (and on mount). */
+async function refreshSurfacingMethods(): Promise<void> {
+  try {
+    surfacingMethods.value = await fetchMethods();
+  } catch {
+    surfacingMethods.value = [];
+  }
+  if (!surfacingMethods.value.includes(surfacingMethod.value)) {
+    surfacingMethod.value = surfacingMethods.value[0] ?? "";
+  }
+}
+watch(expandedPanel, (panel) => {
+  if (panel === "surfacer") void refreshSurfacingMethods();
+});
+
+async function runSurfacing(): Promise<void> {
+  if (!surfacePreview || surfacingBusy.value || !surfacingMethod.value) return;
+  surfacingBusy.value = true;
+  surfacingProgress.value = 0;
+  try {
+    const glb = await surfaceSketch(
+      surfacingMethod.value,
+      buildSurfacingSketch(doc),
+      {},
+      (status) => (surfacingProgress.value = status.progress),
+    );
+    await surfacePreview.show(glb);
+    hasSurface.value = true;
+  } catch (error) {
+    alert(`Surfacing failed: ${error instanceof Error ? error.message : error}`);
+  } finally {
+    surfacingBusy.value = false;
+  }
+}
+
+function clearSurface(): void {
+  surfacePreview?.clear();
+  hasSurface.value = false;
 }
 
 function cycleGizmoMode(): void {

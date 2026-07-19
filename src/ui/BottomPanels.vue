@@ -72,6 +72,51 @@
           </div>
         </template>
 
+        <!-- Surfacer -->
+        <template v-else-if="panel === 'surfacer'">
+          <div v-if="methods.length === 0" class="empty">
+            Surfacing server offline — start it in surfacing-server/ (see its
+            README), then reopen this panel.
+          </div>
+          <template v-else>
+            <select
+              class="method-select"
+              :value="surfacingMethod"
+              title="Surfacing method — one server adapter per method"
+              @change="
+                $emit(
+                  'set-surfacing-method',
+                  ($event.target as HTMLSelectElement).value,
+                )
+              "
+            >
+              <option v-for="method in methods" :key="method" :value="method">
+                {{ method }}
+              </option>
+            </select>
+          </template>
+          <div class="panel-actions">
+            <button
+              :disabled="surfacing || methods.length === 0"
+              title="Send the sketch to the surfacing server and show the resulting mesh"
+              @click="$emit('surface')"
+            >
+              {{
+                surfacing
+                  ? `Surfacing ${Math.round(surfacingProgress * 100)}%`
+                  : "Surface"
+              }}
+            </button>
+            <button
+              v-if="hasSurface"
+              title="Remove the surfacing result from the scene"
+              @click="$emit('clear-surface')"
+            >
+              Clear
+            </button>
+          </div>
+        </template>
+
         <!-- Articulations -->
         <template v-else>
           <div v-if="joints.length === 0" class="empty">
@@ -175,7 +220,7 @@
 import type { Joint, JointDofName, Part, Pose } from "../core/types";
 import { JOINT_DOF_NAMES, dofUnlocked, jointKindLabel } from "../core/types";
 
-export type PanelName = "parts" | "poses" | "articulations";
+export type PanelName = "parts" | "poses" | "articulations" | "surfacer";
 
 defineProps<{
   expanded: PanelName | null;
@@ -190,6 +235,12 @@ defineProps<{
   activePartId: string | null;
   strokeCounts: Record<string, number>;
   exploding: boolean;
+  /** Adapter names from the surfacing server; empty = server offline. */
+  methods: string[];
+  surfacingMethod: string;
+  surfacing: boolean;
+  surfacingProgress: number;
+  hasSurface: boolean;
 }>();
 
 defineEmits<{
@@ -209,6 +260,9 @@ defineEmits<{
   "new-joint": [];
   "arm-dof": [dof: JointDofName];
   "toggle-mirror": [];
+  "set-surfacing-method": [method: string];
+  surface: [];
+  "clear-surface": [];
 }>();
 
 const DOF_LABELS: Record<JointDofName, string> = {
@@ -244,17 +298,20 @@ function jointTooltip(joint: Joint): string {
   return `${jointKindLabel(joint)} joint${ranges ? ` — ${ranges}` : ""}. Click to drive it (Articulate tool); ✎ edits it.`;
 }
 
-const panels: PanelName[] = ["articulations", "poses", "parts"];
+const panels: PanelName[] = ["surfacer", "articulations", "poses", "parts"];
 const panelLabels: Record<PanelName, string> = {
   parts: "Parts",
   poses: "Poses",
   articulations: "Articulations",
+  surfacer: "Surfacer",
 };
 const headerTooltips: Record<PanelName, string> = {
   parts: "Part segmentation — group strokes into parts with the Segment tool",
   poses: "Saved poses — snapshots of every stroke's placement",
   articulations:
     "Joints between parts — articulate them with the Articulate tool (A), toggle IK here",
+  surfacer:
+    "Surface the sketch — pick a method and run it on the local surfacing server",
 };
 </script>
 
@@ -461,6 +518,20 @@ const headerTooltips: Record<PanelName, string> = {
 }
 
 .ik-toggle:hover {
+  background: #ffe8b3;
+}
+
+.method-select {
+  height: 32px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 16px;
+  background: #eeeeee;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.method-select:hover {
   background: #ffe8b3;
 }
 </style>

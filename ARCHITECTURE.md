@@ -7,17 +7,29 @@ Stack: Vite, TypeScript, Vue 3, three.js, camera-controls.
 
 ```
 src/
-  core/    # document model: strokes, parts, undo, serialization. Pure TS,
-           # no three.js, no DOM — unit-testable in isolation.
-  engine/  # three.js layer: viewport, render loop, stroke meshes, gizmos.
-  tools/   # draw / select / erase state machines consuming pointer events.
-  ui/      # Vue components. Talks to core/engine, never the other way.
+  core/      # document model: strokes, parts, undo, serialization. Pure TS,
+             # no three.js, no DOM — unit-testable in isolation.
+  engine/    # three.js layer: viewport, render loop, stroke meshes, gizmos.
+  tools/     # draw / select / erase state machines consuming pointer events.
+  ui/        # Vue components. Talks to core/engine, never the other way.
+  surfacing/ # fetch client for the surfacing job server. Pure TS over core
+             # types; sits beside core, anything above may import it.
 ```
 
 Imports may only point left-to-right in `core ← engine ← tools ← ui`.
 The document (in `core/`) is the source of truth; three.js meshes are a
 derived view of it. UI framework code stays out of the engine so the shell
 is replaceable.
+
+## Surfacing sidecar
+
+`surfacing-server/` is a local FastAPI process (README there) run alongside
+`npm run dev`; the browser reaches it through the `/api` proxy in
+`vite.config.ts`. `src/surfacing/client.ts` submits the sketch (world-space
+centerlines + parts + joints) as an async job and polls for the result glb,
+which `engine/SurfacePreview.ts` shows as a derived scene overlay — never
+part of the document or undo stack. One adapter per surfacing method on the
+python side; each real method runs in its own environment via subprocess.
 
 ## Rendering
 
