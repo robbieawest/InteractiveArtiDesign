@@ -25,6 +25,9 @@ export const HIGHLIGHT_COLORS: Record<HighlightKind, THREE.Color> = {
 export class StrokeRenderer {
   private groups = new Map<string, THREE.Group>();
   private readonly unsubscribe: () => void;
+  /** Whole-sketch visibility toggle (the "Hide Sketch" button); applies to
+   *  existing groups and any created while hidden. */
+  private visible = true;
 
   constructor(doc: SketchDocument, private readonly viewport: Viewport) {
     this.unsubscribe = doc.subscribe((event) => this.onEvent(event));
@@ -65,6 +68,13 @@ export class StrokeRenderer {
 
   clearHighlights(): void {
     for (const id of this.groups.keys()) this.setHighlight(id, false);
+  }
+
+  /** Show or hide every stroke at once (drawing/selection still work). */
+  setVisible(visible: boolean): void {
+    this.visible = visible;
+    for (const group of this.groups.values()) group.visible = visible;
+    this.viewport.invalidate();
   }
 
   strokeIdFor(object: THREE.Object3D): string | undefined {
@@ -125,6 +135,7 @@ export class StrokeRenderer {
     }
 
     applyTransform(group, stroke.transform);
+    group.visible = this.visible;
     this.groups.set(stroke.id, group);
     this.viewport.scene.add(group);
   }

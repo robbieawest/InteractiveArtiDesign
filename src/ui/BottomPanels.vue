@@ -90,11 +90,123 @@
                 )
               "
             >
-              <option v-for="method in methods" :key="method" :value="method">
-                {{ method }}
+              <option
+                v-for="method in methods"
+                :key="method.name"
+                :value="method.name"
+              >
+                {{ method.name }}
               </option>
             </select>
+            <template v-if="methodParams.length > 0">
+              <div
+                v-for="param in methodParams"
+                :key="param.name"
+                class="row param-row"
+                :class="{ disabled: !paramEnabled(param) }"
+                :title="param.help"
+              >
+                <span class="row-label">{{ param.label }}</span>
+                <input
+                  v-if="param.type === 'bool'"
+                  type="checkbox"
+                  :checked="surfacingOptions[param.name] === true"
+                  :disabled="!paramEnabled(param)"
+                  @change="
+                    $emit(
+                      'set-surfacing-option',
+                      param.name,
+                      ($event.target as HTMLInputElement).checked,
+                    )
+                  "
+                />
+                <select
+                  v-else-if="param.type === 'choice'"
+                  class="param-input"
+                  :value="surfacingOptions[param.name]"
+                  :disabled="!paramEnabled(param)"
+                  @change="
+                    $emit(
+                      'set-surfacing-option',
+                      param.name,
+                      ($event.target as HTMLSelectElement).value,
+                    )
+                  "
+                >
+                  <option
+                    v-for="choice in param.choices"
+                    :key="choice"
+                    :value="choice"
+                  >
+                    {{ choice }}
+                  </option>
+                </select>
+                <input
+                  v-else
+                  type="number"
+                  class="param-input"
+                  :value="surfacingOptions[param.name]"
+                  :min="param.min"
+                  :max="param.max"
+                  :step="param.step ?? (param.type === 'int' ? 1 : 'any')"
+                  :disabled="!paramEnabled(param)"
+                  @change="commitNumber(param, $event)"
+                />
+              </div>
+              <button
+                class="mini defaults"
+                title="Reset every parameter to the adapter's defaults"
+                @click="$emit('reset-surfacing-options')"
+              >
+                Reset to defaults
+              </button>
+            </template>
           </template>
+
+          <!-- general surface appearance (independent of the method) -->
+          <div class="surf-appearance">
+            <span class="surf-heading">Surface appearance</span>
+            <div class="row param-row" title="Color of the surface overlay">
+              <span class="row-label">Color</span>
+              <input
+                type="color"
+                :value="surfaceColor"
+                @input="
+                  $emit(
+                    'set-surface-color',
+                    ($event.target as HTMLInputElement).value,
+                  )
+                "
+              />
+            </div>
+            <div
+              class="row param-row"
+              title="Opacity of the surface overlay (lower = strokes show through)"
+            >
+              <span class="row-label">Opacity</span>
+              <input
+                type="range"
+                min="0.05"
+                max="1"
+                step="0.05"
+                :value="surfaceOpacity"
+                @input="
+                  $emit(
+                    'set-surface-opacity',
+                    Number(($event.target as HTMLInputElement).value),
+                  )
+                "
+              />
+            </div>
+          </div>
+
+          <pre
+            v-if="surfacingLog.length > 0"
+            ref="logEl"
+            class="surf-log"
+            @scroll="onLogScroll"
+            >{{ surfacingLog.join("\n") }}</pre
+          >
           <div class="panel-actions">
             <button
               :disabled="surfacing || methods.length === 0"
@@ -217,12 +329,18 @@
 </template>
 
 <script setup lang="ts">
+import { nextTick, useTemplateRef, watch } from "vue";
 import type { Joint, JointDofName, Part, Pose } from "../core/types";
 import { JOINT_DOF_NAMES, dofUnlocked, jointKindLabel } from "../core/types";
+import type {
+  MethodInfo,
+  MethodOptions,
+  MethodParam,
+} from "../surfacing/client";
 
 export type PanelName = "parts" | "poses" | "articulations" | "surfacer";
 
-defineProps<{
+const props = defineProps<{
   expanded: PanelName | null;
   parts: Part[];
   poses: Pose[];
@@ -235,15 +353,24 @@ defineProps<{
   activePartId: string | null;
   strokeCounts: Record<string, number>;
   exploding: boolean;
-  /** Adapter names from the surfacing server; empty = server offline. */
-  methods: string[];
+  /** Methods from the surfacing server; empty = server offline. */
+  methods: MethodInfo[];
   surfacingMethod: string;
+  /** Parameter declarations of the selected method. */
+  methodParams: MethodParam[];
+  /** Current values for those parameters. */
+  surfacingOptions: MethodOptions;
   surfacing: boolean;
   surfacingProgress: number;
   hasSurface: boolean;
+  /** Surface overlay appearance (applies live to the shown mesh). */
+  surfaceColor: string;
+  surfaceOpacity: number;
+  /** Free-form adapter output shown in the log window. */
+  surfacingLog: string[];
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   "set-expanded": [panel: PanelName | null];
   "set-active-part": [partId: string];
   "add-part": [];
@@ -261,9 +388,54 @@ defineEmits<{
   "arm-dof": [dof: JointDofName];
   "toggle-mirror": [];
   "set-surfacing-method": [method: string];
+  "set-surfacing-option": [name: string, value: number | boolean | string];
+  "reset-surfacing-options": [];
+  "set-surface-color": [color: string];
+  "set-surface-opacity": [opacity: number];
   surface: [];
   "clear-surface": [];
 }>();
+
+/** A param with an `enabledWhen` clause is only editable while the referenced
+ *  param currently holds the required value (e.g. per-part iterations unlock
+ *  once part-based evaluation is ticked on). */
+function paramEnabled(param: MethodParam): boolean {
+  const cond = param.enabledWhen;
+  if (!cond) return true;
+  return props.surfacingOptions[cond.param] === cond.equals;
+}
+
+/** Number inputs: parse, clamp to the declared range, round ints, and fall
+ *  back to the default when the field is left non-numeric. */
+function commitNumber(param: MethodParam, event: Event): void {
+  const input = event.target as HTMLInputElement;
+  let value = Number(input.value);
+  if (!Number.isFinite(value)) value = param.default as number;
+  if (param.min !== undefined) value = Math.max(param.min, value);
+  if (param.max !== undefined) value = Math.min(param.max, value);
+  if (param.type === "int") value = Math.round(value);
+  input.value = String(value); // reflect the sanitized value back
+  emit("set-surfacing-option", param.name, value);
+}
+
+// the log window follows new lines unless the user scrolled up to read
+const logEl = useTemplateRef<HTMLPreElement>("logEl");
+let logFollowing = true;
+
+function onLogScroll(): void {
+  const el = logEl.value;
+  if (!el) return;
+  logFollowing = el.scrollTop + el.clientHeight >= el.scrollHeight - 12;
+}
+
+watch(
+  () => props.surfacingLog.length,
+  async () => {
+    await nextTick();
+    const el = logEl.value;
+    if (el && logFollowing) el.scrollTop = el.scrollHeight;
+  },
+);
 
 const DOF_LABELS: Record<JointDofName, string> = {
   translation: "Slide",
@@ -533,5 +705,75 @@ const headerTooltips: Record<PanelName, string> = {
 
 .method-select:hover {
   background: #ffe8b3;
+}
+
+.param-row {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  cursor: default;
+  font-size: 0.9em;
+}
+
+.param-row .row-label {
+  font-weight: 700;
+}
+
+/* an enabledWhen param whose condition isn't met: dimmed, input disabled */
+.param-row.disabled {
+  opacity: 0.4;
+}
+
+.param-input {
+  width: 92px;
+  height: 26px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 13px;
+  background: #eeeeee;
+  font-weight: 700;
+  font-size: 0.95em;
+}
+
+.mini.defaults {
+  width: auto;
+  align-self: flex-end;
+  padding: 0 10px;
+  font-size: 0.75em;
+}
+
+.surf-appearance {
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  margin-top: 6px;
+  padding-top: 4px;
+}
+
+.surf-heading {
+  font-size: 0.75em;
+  font-weight: 700;
+  opacity: 0.6;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.surf-appearance input[type="color"] {
+  width: 44px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+.surf-log {
+  height: 130px;
+  margin: 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: #f4f4f4;
+  overflow-y: scroll;
+  font-size: 0.68em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>

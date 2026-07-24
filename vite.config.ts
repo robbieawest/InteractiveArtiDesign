@@ -57,5 +57,11 @@ export default defineConfig({
     proxy: {
       "/api": "http://127.0.0.1:8801",
     },
+    watch: {
+      // never watch the python sidecar: its venvs hold tens of thousands
+      // of files and jobs/ writes checkpoints throughout an optimization —
+      // enough to exhaust inotify watches and crash vite (ENOSPC)
+      ignored: ["**/surfacing-server/**"],
+    },
   },
 });

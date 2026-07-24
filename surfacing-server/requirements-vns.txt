@@ -1,0 +1,22 @@
+# Environment for the VNS adapter (methods/vns), separate from the server env.
+# Install torch FIRST from the ROCm index (AMD GPU), then the rest:
+#   python3 -m venv .venv-vns
+#   .venv-vns/bin/pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/rocm6.2
+#   .venv-vns/bin/pip install -r requirements-vns.txt
+# scikit-sparse needs the SuiteSparse headers first:
+#   sudo apt install libsuitesparse-dev
+# numpy<2: scikit-sparse 0.4.12 wheels build against numpy 1.x headers
+numpy<2
+scipy
+open3d
+trimesh
+scikit-image
+pyvista
+plotly
+pillow
+tqdm
+tensorboardX
+torchinfo
+numba
+# ==0.4.12: newer releases need SuiteSparse >= 7, Ubuntu 22.04 ships 5.10
+scikit-sparse==0.4.12

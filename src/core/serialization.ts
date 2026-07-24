@@ -18,8 +18,9 @@ import { SketchDocument } from "./SketchDocument";
 export const FORMAT_NAME = "interactive-arti-design";
 // 1 = legacy Penzil (see legacyPenzil.ts); 2 = strokes only;
 // 3 = adds parts, poses, exploded state; 4 = adds typed joints;
-// 5 = joints become screws (per-DoF ranges/values instead of a type)
-export const FORMAT_VERSION = 5;
+// 5 = joints become screws (per-DoF ranges/values instead of a type);
+// 6 = optional embedded surfacing result (`surface`, written by the ui)
+export const FORMAT_VERSION = 6;
 
 /** Version-4 joint shape, kept for migration. */
 interface JointJsonV4 {
@@ -64,6 +65,16 @@ interface StrokeJson {
   partId?: string;
 }
 
+/** The last surfacing result, embedded so a saved sketch reopens with its
+ *  surface. Written and read by the ui layer only: the mesh is derived
+ *  output and never enters the SketchDocument or the undo stack. */
+export interface SurfaceJson {
+  /** Adapter name that produced the mesh (e.g. "vns"). */
+  method: string;
+  /** The result .glb, base64-encoded. */
+  glb: string;
+}
+
 export interface DocumentJson {
   format: typeof FORMAT_NAME;
   version: number;
@@ -74,6 +85,8 @@ export interface DocumentJson {
   exploded?: boolean;
   /** Since version 4; version-5 screw shape or version-4 typed shape. */
   joints?: (Joint | JointJsonV4)[];
+  /** Since version 6; absent when nothing was surfaced. */
+  surface?: SurfaceJson;
 }
 
 export function serializeDocument(doc: SketchDocument): DocumentJson {

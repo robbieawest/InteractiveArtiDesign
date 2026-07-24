@@ -4,7 +4,7 @@ from typing import Any, Optional
 import numpy as np
 import trimesh
 
-from .base import ProgressFn, SurfacingAdapter
+from .base import LogFn, ProgressFn, SurfacingAdapter
 
 
 class BBoxAdapter(SurfacingAdapter):
@@ -15,8 +15,25 @@ class BBoxAdapter(SurfacingAdapter):
 
     name = "bbox"
 
+    params = [
+        {
+            "name": "pad",
+            "label": "Padding",
+            "type": "float",
+            "default": 0.02,
+            "min": 0.0,
+            "max": 0.5,
+            "step": 0.01,
+            "help": "Box padding as a fraction of the part's diagonal",
+        },
+    ]
+
     def run(
-        self, sketch: dict[str, Any], options: dict[str, Any], report: ProgressFn
+        self,
+        sketch: dict[str, Any],
+        options: dict[str, Any],
+        report: ProgressFn,
+        log: LogFn,
     ) -> bytes:
         part_names = {p["id"]: p["name"] for p in sketch.get("parts", [])}
         groups: dict[Optional[str], list[np.ndarray]] = {}
@@ -37,7 +54,10 @@ class BBoxAdapter(SurfacingAdapter):
             time.sleep(0.5)  # fake optimization time so progress is visible
             points = np.vstack(arrays)
             lo, hi = points.min(axis=0), points.max(axis=0)
-            pad = 0.02 * (float(np.linalg.norm(hi - lo)) or 1.0)
+            log(f"{name}: {len(arrays)} strokes, {len(points)} points, "
+                f"bounds {lo.round(3).tolist()} .. {hi.round(3).tolist()}")
+            pad_fraction = float(options.get("pad", 0.02))
+            pad = pad_fraction * (float(np.linalg.norm(hi - lo)) or 1.0)
             box = trimesh.creation.box(bounds=np.array([lo - pad, hi + pad]))
             box.visual.face_colors = [255, 170, 60, 140]
             scene.add_geometry(box, node_name=name, geom_name=name)

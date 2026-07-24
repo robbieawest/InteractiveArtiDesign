@@ -27,9 +27,14 @@ as offline.
 
 ## Protocol
 
-- `GET  /api/health` → `{ status, methods }`
+- `GET  /api/health` → `{ status, methods: [{ name, params }] }` — `params`
+  are the adapter's user-editable parameter declarations (see
+  `adapters/base.py`); the Surfacer panel renders them generically and sends
+  the chosen values back as the job's `options`
 - `POST /api/jobs` with `{ method, sketch, options }` → `{ jobId }`
 - `GET  /api/jobs/{id}` → `{ status: pending|running|done|error, progress, message, error }`
+- `GET  /api/jobs/{id}/log?after=N` → `{ lines, next }` — free-form adapter
+  log lines from index N on (shown in the Surfacer panel's log window)
 - `GET  /api/jobs/{id}/result` → binary glTF (`.glb`)
 
 `sketch` is built by `src/surfacing/client.ts`: world-space stroke

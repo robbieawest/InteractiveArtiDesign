@@ -3,3 +3,9 @@ uvicorn
 numpy
 scipy
 trimesh
+# boolean-union backend for the VNS adapter's part-based mode (trimesh 4.x
+# uses manifold3d by default); pure-python wheel, no system deps
+manifold3d
+# trimesh imports networkx lazily for its graph ops (mesh repair, splitting,
+# boolean union) — needed by the part-based combine path, unbundled otherwise
+networkx

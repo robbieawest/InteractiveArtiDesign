@@ -1,6 +1,10 @@
 node_modules
 dist
 surfacing-server/.venv
+surfacing-server/.venv-vns
+surfacing-server/jobs
 __pycache__
 *.local
 .DS_Store
+surfacing-server/benchmarks/forks
+surfacing-server/benchmarks/results

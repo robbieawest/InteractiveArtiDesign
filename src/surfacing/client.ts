@@ -55,19 +55,46 @@ export function buildSurfacingSketch(doc: SketchDocument): SurfacingSketch {
   };
 }
 
-/** The methods (adapter names) the surfacing server currently offers.
- *  Throws with a start-the-server hint when it is unreachable. */
-export async function fetchMethods(): Promise<string[]> {
-  const response = await request("/api/health");
-  return ((await response.json()) as { methods: string[] }).methods;
+/** A user-editable parameter one adapter declares; the Surfacer panel
+ *  renders these generically and sends the values back in `options`. */
+export interface MethodParam {
+  name: string;
+  label: string;
+  type: "int" | "float" | "bool" | "choice";
+  default: number | boolean | string;
+  min?: number;
+  max?: number;
+  step?: number;
+  choices?: string[];
+  help?: string;
+  /** When set, the input is only enabled while another param equals a given
+   *  value (e.g. a per-part control that unlocks when part-based is on). It
+   *  still travels in `options`; the adapter decides whether to use it. */
+  enabledWhen?: { param: string; equals: number | boolean | string };
 }
 
-/** Submit a job and poll it to completion; resolves with the result glb. */
+export interface MethodInfo {
+  name: string;
+  params: MethodParam[];
+}
+
+export type MethodOptions = Record<string, number | boolean | string>;
+
+/** The methods the surfacing server currently offers, with their parameter
+ *  declarations. Throws with a start-the-server hint when unreachable. */
+export async function fetchMethods(): Promise<MethodInfo[]> {
+  const response = await request("/api/health");
+  return ((await response.json()) as { methods: MethodInfo[] }).methods;
+}
+
+/** Submit a job and poll it to completion; resolves with the result glb.
+ *  `onLog` receives batches of free-form adapter log lines as they appear. */
 export async function surfaceSketch(
   method: string,
   sketch: SurfacingSketch,
   options: Record<string, unknown> = {},
   onProgress?: (status: JobStatus) => void,
+  onLog?: (lines: string[]) => void,
 ): Promise<ArrayBuffer> {
   const created = await request("/api/jobs", {
     method: "POST",
@@ -76,18 +103,34 @@ export async function surfaceSketch(
   });
   const { jobId } = (await created.json()) as { jobId: string };
 
-  for (;;) {
-    await delay(500);
-    const status = (await (
-      await request(`/api/jobs/${jobId}`)
-    ).json()) as JobStatus;
-    onProgress?.(status);
-    if (status.status === "done") {
-      return (await request(`/api/jobs/${jobId}/result`)).arrayBuffer();
+  let logCursor = 0;
+  const pullLog = async () => {
+    if (!onLog) return;
+    const { lines, next } = (await (
+      await request(`/api/jobs/${jobId}/log?after=${logCursor}`)
+    ).json()) as { lines: string[]; next: number };
+    logCursor = next;
+    if (lines.length > 0) onLog(lines);
+  };
+
+  try {
+    for (;;) {
+      await delay(500);
+      const status = (await (
+        await request(`/api/jobs/${jobId}`)
+      ).json()) as JobStatus;
+      onProgress?.(status);
+      await pullLog();
+      if (status.status === "done") {
+        return (await request(`/api/jobs/${jobId}/result`)).arrayBuffer();
+      }
+      if (status.status === "error") {
+        throw new Error(status.error ?? "surfacing failed");
+      }
     }
-    if (status.status === "error") {
-      throw new Error(status.error ?? "surfacing failed");
-    }
+  } finally {
+    // catch log lines emitted between the last poll and the terminal state
+    await pullLog().catch(() => {});
   }
 }
 

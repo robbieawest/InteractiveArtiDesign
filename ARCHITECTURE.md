@@ -126,4 +126,13 @@ alt+drag = orbit.
      while demonstrating, committed ranges otherwise. The tool always works
      at the rest pose (posed joints are zeroed first, undoably).
      `engine/JointLines.ts` draws parent↔child lines while exploded. (done)
-   - Articulation discovery, skinning: not yet.
+   - **Skinning** — the surfacing overlay (`engine/SurfacePreview.ts`) is
+     rigidly skinned to the rig: on `bindSkin` each mesh vertex is bound to
+     the nearest part (by the sketch's world-space stroke points) and its
+     world rest position snapshotted; `repose` moves each vertex by that
+     part's `computeArticulationPatch` delta, so articulating deforms the
+     surface exactly as it deforms the strokes. Bound automatically whenever a
+     surface is evaluated or loaded; re-posed on any document change (pose
+     signature memoized to skip redundant work). One part per vertex (no blend
+     weights) — still derived output, never in the document or undo stack.
+   - Articulation discovery, smooth (blend-weighted) skinning: not yet.

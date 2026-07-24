@@ -7,7 +7,7 @@ single-user localhost sidecar, restarting it just forgets old jobs.
 
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -26,6 +26,9 @@ class Job:
     message: str = ""
     error: Optional[str] = None
     result: Optional[bytes] = None
+    # free-form text lines emitted by the adapter (fetched incrementally by
+    # the client via /log; append-only so line indices are stable cursors)
+    log: list[str] = field(default_factory=list)
 
 
 app = FastAPI(title="Surfacing job server")
@@ -46,7 +49,7 @@ def _run_job(job: Job, sketch: dict[str, Any], options: dict[str, Any]) -> None:
 
     job.status = "running"
     try:
-        job.result = ADAPTERS[job.method].run(sketch, options, report)
+        job.result = ADAPTERS[job.method].run(sketch, options, report, job.log.append)
         job.progress = 1.0
         job.status = "done"
     except Exception as exc:  # surface the failure to the client, don't die
@@ -56,7 +59,13 @@ def _run_job(job: Job, sketch: dict[str, Any], options: dict[str, Any]) -> None:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "methods": sorted(ADAPTERS)}
+    return {
+        "status": "ok",
+        "methods": [
+            {"name": name, "params": ADAPTERS[name].params}
+            for name in sorted(ADAPTERS)
+        ],
+    }
 
 
 @app.post("/api/jobs")
@@ -86,6 +95,16 @@ def job_status(job_id: str) -> dict[str, Any]:
         "message": job.message,
         "error": job.error,
     }
+
+
+@app.get("/api/jobs/{job_id}/log")
+def job_log(job_id: str, after: int = 0) -> dict[str, Any]:
+    """Log lines from index `after` on, plus the cursor for the next call."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+    lines = job.log[after:]
+    return {"lines": lines, "next": after + len(lines)}
 
 
 @app.get("/api/jobs/{job_id}/result")

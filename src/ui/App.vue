@@ -166,6 +166,20 @@
     >
       Redo
     </button>
+    <button
+      title="Show or hide all sketch strokes (drawing and selection still work)"
+      @click="toggleSketchVisible"
+    >
+      {{ sketchVisible ? "Hide Sketch" : "Show Sketch" }}
+    </button>
+    <button
+      :disabled="!hasSurface"
+      title="Show or hide the surfacing result mesh"
+      @click="toggleSurfaceVisible"
+    >
+      {{ surfaceVisible ? "Hide Surface" : "Show Surface" }}
+    </button>
+    <span class="divider" />
     <button title="Save the sketch as a JSON file" @click="saveFile">
       Save
     </button>
@@ -204,9 +218,14 @@
     :exploding="explodeMode"
     :methods="surfacingMethods"
     :surfacing-method="surfacingMethod"
+    :method-params="currentMethodParams"
+    :surfacing-options="currentOptions"
     :surfacing="surfacingBusy"
     :surfacing-progress="surfacingProgress"
     :has-surface="hasSurface"
+    :surface-color="surfaceColor"
+    :surface-opacity="surfaceOpacity"
+    :surfacing-log="surfacingLog"
     @set-expanded="expandedPanel = $event"
     @set-active-part="setActivePart"
     @add-part="addPart"
@@ -224,6 +243,10 @@
     @arm-dof="jointTool?.armDof($event)"
     @toggle-mirror="jointTool?.setMirror(!mirrorRange)"
     @set-surfacing-method="surfacingMethod = $event"
+    @set-surfacing-option="setSurfacingOption"
+    @reset-surfacing-options="resetSurfacingOptions"
+    @set-surface-color="setSurfaceColor"
+    @set-surface-opacity="setSurfaceOpacity"
     @surface="runSurfacing"
     @clear-surface="clearSurface"
   />
@@ -271,7 +294,11 @@ import {
   collapseCommand,
   resetArticulationCommand,
 } from "../core/undo";
-import { deserializeDocument, serializeDocument } from "../core/serialization";
+import {
+  deserializeDocument,
+  serializeDocument,
+  type DocumentJson,
+} from "../core/serialization";
 import { importLegacyPenzil, isLegacyPenzilJson } from "../core/legacyPenzil";
 import { importSketchLabGltf, parseGlb } from "../engine/importSketchLab";
 import { SurfacePreview } from "../engine/SurfacePreview";
@@ -279,6 +306,8 @@ import {
   buildSurfacingSketch,
   fetchMethods,
   surfaceSketch,
+  type MethodInfo,
+  type MethodOptions,
 } from "../surfacing/client";
 import type { JointDofName, SurfaceShape } from "../core/types";
 import { jointPosed } from "../core/types";
@@ -337,9 +366,28 @@ const resetDialogOpen = ref(false);
 const surfacingBusy = ref(false);
 const surfacingProgress = ref(0);
 const hasSurface = ref(false);
-/** Adapter names from the server; empty while it is unreachable. */
-const surfacingMethods = ref<string[]>([]);
+const surfaceVisible = ref(true);
+const sketchVisible = ref(true);
+/** Surface overlay appearance, edited from the Surfacer panel. */
+const surfaceColor = ref("#ffaa3c");
+const surfaceOpacity = ref(0.55);
+/** Methods from the server; empty while it is unreachable. */
+const surfacingMethods = ref<MethodInfo[]>([]);
 const surfacingMethod = ref("");
+/** Edited parameter values, kept per method so switching loses nothing. */
+const surfacingOptions = ref<Record<string, MethodOptions>>({});
+const currentMethodParams = computed(
+  () =>
+    surfacingMethods.value.find((m) => m.name === surfacingMethod.value)
+      ?.params ?? [],
+);
+const currentOptions = computed(
+  () => surfacingOptions.value[surfacingMethod.value] ?? {},
+);
+const surfacingLog = ref<string[]>([]);
+const SURFACING_LOG_CAP = 1000;
+/** The shown surface's glb + producing method, kept for embedding in saves. */
+let surfaceGlb: { method: string; bytes: ArrayBuffer } | null = null;
 
 // parts / poses / panels
 const expandedPanel = ref<PanelName | null>(null);
@@ -472,6 +520,10 @@ watch(docVersion, () => {
     if (activeTool.value === "none") activate("none");
   }
 });
+// the skinned surface follows the rig: re-pose it whenever the document
+// changes (articulation writes joint values). Cheap + skipped when the pose
+// is unchanged or nothing is bound.
+watch(docVersion, () => surfacePreview?.repose(doc.allJoints()));
 watch(ikEnabled, (value) => articulateTool?.setIkMode(value));
 watch(segmentMode, (value) => segmentTool && (segmentTool.mode = value));
 watch([strokeColor, strokeWidth], ([color, width]) => {
@@ -646,9 +698,35 @@ async function refreshSurfacingMethods(): Promise<void> {
   } catch {
     surfacingMethods.value = [];
   }
-  if (!surfacingMethods.value.includes(surfacingMethod.value)) {
-    surfacingMethod.value = surfacingMethods.value[0] ?? "";
+  if (!surfacingMethods.value.some((m) => m.name === surfacingMethod.value)) {
+    surfacingMethod.value = surfacingMethods.value[0]?.name ?? "";
   }
+  // seed defaults for params the user hasn't touched yet (new methods, or
+  // params added to an adapter since the last fetch)
+  for (const method of surfacingMethods.value) {
+    const options = (surfacingOptions.value[method.name] ??= {});
+    for (const param of method.params) {
+      if (!(param.name in options)) options[param.name] = param.default;
+    }
+  }
+}
+
+function setSurfacingOption(
+  name: string,
+  value: number | boolean | string,
+): void {
+  const options = surfacingOptions.value[surfacingMethod.value];
+  if (options) options[name] = value;
+}
+
+function resetSurfacingOptions(): void {
+  const method = surfacingMethods.value.find(
+    (m) => m.name === surfacingMethod.value,
+  );
+  if (!method) return;
+  surfacingOptions.value[method.name] = Object.fromEntries(
+    method.params.map((p) => [p.name, p.default]),
+  );
 }
 watch(expandedPanel, (panel) => {
   if (panel === "surfacer") void refreshSurfacingMethods();
@@ -656,17 +734,35 @@ watch(expandedPanel, (panel) => {
 
 async function runSurfacing(): Promise<void> {
   if (!surfacePreview || surfacingBusy.value || !surfacingMethod.value) return;
+  const method = surfacingMethod.value;
   surfacingBusy.value = true;
   surfacingProgress.value = 0;
+  surfacingLog.value = [];
   try {
     const glb = await surfaceSketch(
-      surfacingMethod.value,
+      method,
       buildSurfacingSketch(doc),
-      {},
+      { ...surfacingOptions.value[method] },
       (status) => (surfacingProgress.value = status.progress),
+      (lines) => {
+        surfacingLog.value = [...surfacingLog.value, ...lines].slice(
+          -SURFACING_LOG_CAP,
+        );
+      },
     );
     await surfacePreview.show(glb);
+    // record the result first, so a later skinning hiccup can never lose the
+    // mesh from saves (the glb is what rides along in the .json)
+    surfaceGlb = { method, bytes: glb };
     hasSurface.value = true;
+    surfaceVisible.value = true;
+    surfacePreview.setStyle({
+      color: surfaceColor.value,
+      opacity: surfaceOpacity.value,
+    });
+    // skin the fresh surface to the rig so articulating deforms it; never let
+    // a skinning failure abort the surfacing flow
+    bindSurfaceSkin();
   } catch (error) {
     alert(`Surfacing failed: ${error instanceof Error ? error.message : error}`);
   } finally {
@@ -676,8 +772,41 @@ async function runSurfacing(): Promise<void> {
 
 function clearSurface(): void {
   surfacePreview?.clear();
+  surfaceGlb = null;
   hasSurface.value = false;
 }
+
+/** Skin the current overlay to the rig. Non-fatal: a skinning failure logs
+ *  and leaves the (still valid, still saveable) surface undeformed. */
+function bindSurfaceSkin(): void {
+  try {
+    surfacePreview?.bindSkin(buildSurfacingSketch(doc), doc.allJoints());
+  } catch (error) {
+    console.error("surface skinning failed (surface kept, not skinned):", error);
+  }
+}
+
+function toggleSketchVisible(): void {
+  sketchVisible.value = !sketchVisible.value;
+  strokeRenderer?.setVisible(sketchVisible.value);
+}
+
+function toggleSurfaceVisible(): void {
+  surfaceVisible.value = !surfaceVisible.value;
+  surfacePreview?.setVisible(surfaceVisible.value);
+}
+
+function setSurfaceColor(color: string): void {
+  surfaceColor.value = color;
+}
+
+function setSurfaceOpacity(opacity: number): void {
+  surfaceOpacity.value = opacity;
+}
+
+watch([surfaceColor, surfaceOpacity], ([color, opacity]) => {
+  surfacePreview?.setStyle({ color, opacity });
+});
 
 function cycleGizmoMode(): void {
   const order: GizmoMode[] = ["translate", "rotate", "scale"];
@@ -724,6 +853,7 @@ function onKeyDown(event: KeyboardEvent): void {
 
 function resetStrokes(): void {
   selectTool?.deselect();
+  clearSurface();
   doc.clear();
   undoStack.clear();
   activePartId.value = null;
@@ -749,12 +879,38 @@ function saveThenReset(): void {
 function saveFile(): void {
   const name = prompt("File name", "sketch");
   if (name === null) return;
+  const json = serializeDocument(doc);
+  // the surface rides along so the saved sketch reopens as last seen; it
+  // stays out of the document itself (derived output, not sketch data)
+  if (surfaceGlb) {
+    const glb = bytesToBase64(surfaceGlb.bytes);
+    if (!glb) {
+      console.warn("surface glb is empty; saving without the surface");
+    } else {
+      json.surface = { method: surfaceGlb.method, glb };
+    }
+  }
   downloadBlob(
-    new Blob([JSON.stringify(serializeDocument(doc))], {
-      type: "application/json",
-    }),
+    new Blob([JSON.stringify(json)], { type: "application/json" }),
     `${name}.json`,
   );
+}
+
+function bytesToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunk = 0x8000; // avoid call-stack limits on large meshes
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
 }
 
 async function exportFile(): Promise<void> {
@@ -802,6 +958,7 @@ function loadFile(): void {
             };
         const imported = importSketchLabGltf(source.json, source.bin);
         selectTool?.deselect();
+        clearSurface();
         doc.clear();
         undoStack.clear();
         activePartId.value = null;
@@ -816,6 +973,7 @@ function loadFile(): void {
 
       const json = JSON.parse(await file.text());
       selectTool?.deselect();
+      clearSurface();
       doc.clear();
       undoStack.clear();
       activePartId.value = null;
@@ -826,9 +984,23 @@ function loadFile(): void {
         const loaded = deserializeDocument(json);
         for (const part of loaded.allParts()) doc.addPart(part);
         for (const pose of loaded.allPoses()) doc.addPose(pose);
+        for (const joint of loaded.allJoints()) doc.addJoint(joint);
         doc.exploded = loaded.exploded;
         for (const stroke of loaded.allStrokes()) doc.addStroke(stroke);
         partCounter = loaded.allParts().length;
+        const surface = (json as DocumentJson).surface;
+        if (surface?.glb && surfacePreview) {
+          const bytes = base64ToBytes(surface.glb);
+          await surfacePreview.show(bytes);
+          surfaceGlb = { method: surface.method, bytes };
+          hasSurface.value = true;
+          surfaceVisible.value = true;
+          surfacePreview.setStyle({
+            color: surfaceColor.value,
+            opacity: surfaceOpacity.value,
+          });
+          bindSurfaceSkin();
+        }
       }
       syncExplodeMode();
     } catch (error) {
