@@ -1,0 +1,40 @@
+# Piecewise-Smooth Surface Fitting onto Unstructured 3D Sketches (sf3d).
+#
+# CPU only — no torch, no CUDA/ROCm. The method's own environment.yml pins
+# python 3.7.9 and 2021-era conda packages; these are the same libraries at
+# versions that install on the 3.10 the rest of this server uses.
+#
+#   python3 -m venv .venv-sf3d
+#   .venv-sf3d/bin/pip install -r requirements-sf3d.txt
+#
+# Plus one thing pip cannot do — the graph-cut extension, which needs the
+# gco-v3.0 sources from the authors' site (not redistributable, hence the
+# download step):
+#
+#   cd methods/SurfaceFitting3DSketches/external/pygco
+#   make download && make all
+#
+# `pymesh2` and the CGAL swig bindings are listed in the upstream
+# environment.yml but are only used by preprocessing scripts this adapter does
+# not run (proxy_mesh_cleanup.py, simplify_xyz.py). The adapter's proxy prep
+# uses pymeshlab instead, and utils/projection.py already ships a trimesh
+# fallback for the CGAL closest-point queries.
+
+numpy
+scipy
+networkx
+scikit-learn
+trimesh
+meshio
+Rtree
+matplotlib
+PyMCubes
+potpourri3d
+PyGEL3D
+libigl
+# polyscope is imported at the top of nearly every module in scripts/main, so
+# it has to be installed even though the adapter never opens a window
+polyscope
+# isotropic remeshing for the proxy, standing in for the paper's Instant
+# Meshes (a GUI binary built from source)
+pymeshlab

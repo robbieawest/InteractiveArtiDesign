@@ -54,6 +54,9 @@ export class SurfacePreview {
   /** Our own matcap material, shared across the overlay's meshes and driven by
    *  `style`; replaces whatever the glb shipped so shading + colour are ours. */
   private material: THREE.MeshMatcapMaterial | null = null;
+  /** Pieces published by an in-flight job, by name, so a re-published piece
+   *  replaces its older self instead of stacking on top of it. */
+  private readonly partials = new Map<string, THREE.Object3D>();
 
   // skinning state
   private skinned: SkinnedMesh[] = [];
@@ -73,13 +76,38 @@ export class SurfacePreview {
   async show(glb: ArrayBuffer): Promise<void> {
     const gltf = await this.loader.parseAsync(glb, "");
     this.clear();
-    this.group.add(gltf.scene);
+    this.adopt(gltf.scene);
+  }
+
+  /** Add (or replace) one piece published by a job still in flight, so the
+   *  overlay fills in as the adapter finishes parts instead of appearing all
+   *  at once at the end. Pieces are keyed by the adapter's name for them: the
+   *  same name again is a newer snapshot of that piece and supersedes it.
+   *
+   *  Partial content is unskinned — the final `show` + `bindSkin` is what
+   *  seats the overlay on the rig. */
+  async showPartial(name: string, glb: ArrayBuffer): Promise<void> {
+    const gltf = await this.loader.parseAsync(glb, "");
+    const previous = this.partials.get(name);
+    if (previous) {
+      // keep the shared material: the other pieces are still using it
+      disposeSubtree(previous, this.material);
+      this.group.remove(previous);
+    }
+    // whatever was bound belonged to geometry we are now replacing
+    this.dropSkin();
+    this.partials.set(name, gltf.scene);
+    this.adopt(gltf.scene);
+  }
+
+  /** Put a freshly parsed glb scene into the overlay under our own material. */
+  private adopt(scene: THREE.Object3D): void {
+    this.group.add(scene);
     this.group.visible = true; // a fresh surface always shows
     // take over shading: replace the glb's materials (often with baked vertex
     // colours) with one matcap material we fully control
-    const material = buildSurfaceMaterial();
-    this.material = material;
-    this.group.traverse((obj) => {
+    const material = (this.material ??= buildSurfaceMaterial());
+    scene.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
         // surfacing meshes (VNS marching cubes, concatenated parts) export
         // with positions only — no normals, which matcap shading needs. Add
@@ -93,6 +121,12 @@ export class SurfacePreview {
     });
     this.applyStyle();
     this.viewport.invalidate();
+  }
+
+  private dropSkin(): void {
+    this.skinned = [];
+    this.bindPose = new Map();
+    this.lastPoseKey = "";
   }
 
   /** Surface color and opacity; applied live to the current overlay. */
@@ -267,16 +301,10 @@ export class SurfacePreview {
   }
 
   clear(): void {
-    this.skinned = [];
-    this.bindPose = new Map();
-    this.lastPoseKey = "";
+    this.dropSkin();
+    this.partials.clear();
     for (const child of [...this.group.children]) {
-      child.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) {
-          obj.geometry.dispose();
-          for (const material of asArray(obj.material)) material.dispose();
-        }
-      });
+      disposeSubtree(child);
       this.group.remove(child);
     }
     this.material?.dispose();
@@ -426,6 +454,19 @@ function poseKey(joints: Joint[]): string {
     key += `${d.translation.value},${d.twist.value},${d.swingU.value},${d.swingV.value};`;
   }
   return key;
+}
+
+/** Free the GPU resources of a subtree leaving the overlay. `keep` is the
+ *  material shared with whatever stays behind, so it survives. */
+function disposeSubtree(root: THREE.Object3D, keep?: THREE.Material | null): void {
+  root.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.geometry.dispose();
+      for (const material of asArray(obj.material)) {
+        if (material !== keep) material.dispose();
+      }
+    }
+  });
 }
 
 function asArray(m: THREE.Material | THREE.Material[]): THREE.Material[] {

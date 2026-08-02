@@ -1,0 +1,11 @@
+Model Information:
+* title:	P4-F Electric tricycle
+* source:	https://sketchfab.com/3d-models/p4-f-electric-tricycle-d9ad349cfbd14829b5ba6b475e881a4e
+* author:	sketchlabkaist (https://sketchfab.com/sketchlabkaist)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "P4-F Electric tricycle" (https://sketchfab.com/3d-models/p4-f-electric-tricycle-d9ad349cfbd14829b5ba6b475e881a4e) by sketchlabkaist (https://sketchfab.com/sketchlabkaist) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

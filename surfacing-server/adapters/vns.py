@@ -5,13 +5,21 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .base import LogFn, ProgressFn, SurfacingAdapter
+from .base import EmitFn, LogFn, ProgressFn, SurfacingAdapter
+from .common import (
+    JOBS_DIR,
+    METHODS_DIR,
+    SERVER_DIR,
+    combine_meshes,
+    group_strokes_by_part,
+    method_env,
+    spawn,
+    write_curve_obj,
+)
 
-SERVER_DIR = Path(__file__).resolve().parent.parent
-VNS_DIR = SERVER_DIR / "methods" / "vns"
+VNS_DIR = METHODS_DIR / "vns"
 # override with the VNS_PYTHON env var if the env lives elsewhere
 VNS_PYTHON = Path(os.environ.get("VNS_PYTHON", SERVER_DIR / ".venv-vns" / "bin" / "python"))
-JOBS_DIR = SERVER_DIR / "jobs"
 
 # hyperparameters as run by the paper's batch driver (run_sdf_recon.py),
 # which differ from the argparse defaults; all overridable per job via
@@ -155,6 +163,7 @@ class VnsAdapter(SurfacingAdapter):
         options: dict[str, Any],
         report: ProgressFn,
         log: LogFn,
+        emit: EmitFn,
     ) -> bytes:
         if not VNS_PYTHON.exists():
             raise RuntimeError(
@@ -173,9 +182,9 @@ class VnsAdapter(SurfacingAdapter):
 
         if part_based:
             return self._run_part_based(
-                sketch, options, iters_per_part, job_dir, report, log
+                sketch, options, iters_per_part, job_dir, report, log, emit
             )
-        return self._run_whole(sketch, options, job_dir, report, log)
+        return self._run_whole(sketch, options, job_dir, report, log, emit)
 
     def _run_whole(
         self,
@@ -184,6 +193,7 @@ class VnsAdapter(SurfacingAdapter):
         job_dir: Path,
         report: ProgressFn,
         log: LogFn,
+        emit: EmitFn,
     ) -> bytes:
         import trimesh  # server env
 
@@ -192,12 +202,39 @@ class VnsAdapter(SurfacingAdapter):
         report(0.0, "starting VNS")
         log(f"input: {len(sketch.get('strokes', []))} strokes -> {input_path}")
 
+        logdir = job_dir / "log"
+        # the trainer drops a mesh snapshot every 100 iterations; publish the
+        # newest as it appears so the surface can be watched converging. Every
+        # snapshot carries the same name, which the client reads as "replace
+        # what you have" rather than "here is another part".
+        mesh_dir = logdir / input_path.stem / "mesh"
+        published: set[str] = set()
+
+        def publish_latest() -> None:
+            if not mesh_dir.is_dir():
+                return
+            snapshots = sorted(
+                mesh_dir.glob("mesh_*.ply"),
+                key=lambda p: int(p.stem.split("_")[1]),
+            )
+            if not snapshots or snapshots[-1].name in published:
+                return
+            try:
+                emit("surface", trimesh.load(snapshots[-1]).export(file_type="glb"))
+            except Exception:
+                return  # still being written; the next sweep picks it up
+            published.add(snapshots[-1].name)
+
+        def on_iter(frac: float, msg: str) -> None:
+            report(0.02 + 0.93 * frac, msg)
+            publish_latest()
+
         mesh_path = self._run_vns(
             input_path,
-            job_dir / "log",
+            logdir,
             {**DEFAULTS, **options},
             log,
-            lambda frac, msg: report(0.02 + 0.93 * frac, msg),
+            on_iter,
         )
         report(0.97, "converting result to glb")
         data = trimesh.load(mesh_path).export(file_type="glb")
@@ -212,26 +249,11 @@ class VnsAdapter(SurfacingAdapter):
         job_dir: Path,
         report: ProgressFn,
         log: LogFn,
+        emit: EmitFn,
     ) -> bytes:
         import trimesh  # server env
 
-        part_names = {p["id"]: p["name"] for p in sketch.get("parts", [])}
-        # group strokes by part; unassigned strokes (partId None) are dropped
-        # in this mode — they'll get a coarse whole-object pass later
-        groups: dict[str, list[dict[str, Any]]] = {}
-        dropped = 0
-        for stroke in sketch.get("strokes", []):
-            part_id = stroke.get("partId")
-            if part_id is None:
-                dropped += 1
-                continue
-            groups.setdefault(part_id, []).append(stroke)
-        if not groups:
-            raise ValueError(
-                "part-based VNS needs strokes assigned to parts, but none are"
-            )
-        if dropped:
-            log(f"ignoring {dropped} unassigned stroke(s) (part-based mode)")
+        groups, part_names = group_strokes_by_part(sketch, log)
 
         logdir = job_dir / "log"
         params = {**DEFAULTS, **options, "n_samples": iters_per_part}
@@ -256,49 +278,20 @@ class VnsAdapter(SurfacingAdapter):
                 log,
                 lambda frac, msg, lo=lo: report(lo + span * frac, msg),
             )
-            meshes.append(trimesh.load(mesh_path))
+            mesh = trimesh.load(mesh_path)
+            meshes.append(mesh)
+            # this part is final even though the job isn't — publish it so the
+            # benchmark window can show geometry as it lands
+            emit(str(name), mesh.export(file_type="glb"))
 
         if not meshes:
             raise RuntimeError("part-based VNS produced no surfaces to combine")
 
         report(0.9, f"combining {len(meshes)} part(s)")
-        combined = self._combine_meshes(meshes, log)
+        combined = combine_meshes(meshes, log)
         data = combined.export(file_type="glb")
         report(1.0, f"done ({len(meshes)} parts combined)")
         return data
-
-    @staticmethod
-    def _combine_meshes(meshes: list[Any], log: LogFn) -> Any:
-        """Merge the per-part meshes. A boolean union needs every part to be a
-        closed volume; VNS often surfaces a sketch as an open sheet, so we
-        repair what we can, union when all parts are watertight, and otherwise
-        fall back to a plain concatenation (still one mesh, just no CSG)."""
-        import trimesh  # server env
-
-        for mesh in meshes:
-            # tidy up marching-cubes output so is_volume has a fair chance
-            mesh.merge_vertices()
-            mesh.update_faces(mesh.nondegenerate_faces())
-            mesh.update_faces(mesh.unique_faces())
-            mesh.remove_unreferenced_vertices()
-            trimesh.repair.fill_holes(mesh)
-            trimesh.repair.fix_normals(mesh)
-
-        if len(meshes) == 1:
-            return meshes[0]
-
-        open_count = sum(1 for m in meshes if not m.is_volume)
-        if open_count == 0:
-            try:
-                return trimesh.boolean.union(meshes)
-            except Exception as exc:  # engine missing or numerics blew up
-                log(f"boolean union failed ({exc}); merging without booleans")
-        else:
-            log(
-                f"{open_count}/{len(meshes)} part surface(s) are not closed "
-                "volumes — merging without a boolean union (concatenation)"
-            )
-        return trimesh.util.concatenate(meshes)
 
     def _run_vns(
         self,
@@ -319,17 +312,12 @@ class VnsAdapter(SurfacingAdapter):
         # grid dumps (they cost ~70 MB per checkpoint at grid_res 256)
         cmd += ["--morse_near", "--output_any", "--slim_output"]
 
-        env = {
-            # AMD GPU (ROCm): the user's defines; overridable from outside
-            "HSA_OVERRIDE_GFX_VERSION": "11.0.0",
-            "HIP_VISIBLE_DEVICES": "0",
-            **os.environ,
-        }
+        env = method_env()
 
         log_path = input_path.with_suffix(".log")
         tail: list[str] = []
         with open(log_path, "w") as log_file:
-            proc = subprocess.Popen(
+            proc = spawn(
                 cmd,
                 # cwd matters: the script copies ../models/* for backup and
                 # resolves its own imports relative to the repo
@@ -372,23 +360,3 @@ class VnsAdapter(SurfacingAdapter):
                 f"(full log: {log_path})"
             )
         return meshes[-1]
-
-
-def write_curve_obj(sketch: dict[str, Any], path: Path) -> None:
-    """The sketch strokes as an .obj curve network: v records plus an
-    `l i j` segment per consecutive point pair (what CurveNetwork parses)."""
-    verts: list[str] = []
-    segs: list[str] = []
-    for stroke in sketch.get("strokes", []):
-        points = stroke.get("points", [])
-        start = len(verts)
-        for x, y, z in points:
-            verts.append(f"v {x} {y} {z}")
-        # obj indices are 1-based; VNS drops degenerate edges itself, skip
-        # the exactly-coincident ones here to keep its warnings quiet
-        for i in range(start, len(verts) - 1):
-            if points[i - start] != points[i - start + 1]:
-                segs.append(f"l {i + 1} {i + 2}")
-    if not segs:
-        raise ValueError("sketch has too few stroke points to surface")
-    path.write_text("\n".join(verts + segs) + "\n")

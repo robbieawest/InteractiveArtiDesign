@@ -1,0 +1,11 @@
+Model Information:
+* title:	P4-C Siege tank
+* source:	https://sketchfab.com/3d-models/p4-c-siege-tank-bdd1f26f430b4c189c35c03cc34692e0
+* author:	sketchlabkaist (https://sketchfab.com/sketchlabkaist)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "P4-C Siege tank" (https://sketchfab.com/3d-models/p4-c-siege-tank-bdd1f26f430b4c189c35c03cc34692e0) by sketchlabkaist (https://sketchfab.com/sketchlabkaist) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

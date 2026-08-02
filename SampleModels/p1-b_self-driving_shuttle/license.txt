@@ -1,0 +1,11 @@
+Model Information:
+* title:	P1-B Self-driving shuttle
+* source:	https://sketchfab.com/3d-models/p1-b-self-driving-shuttle-161b00cf76b04455b4fd70373e9e6098
+* author:	sketchlabkaist (https://sketchfab.com/sketchlabkaist)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "P1-B Self-driving shuttle" (https://sketchfab.com/3d-models/p1-b-self-driving-shuttle-161b00cf76b04455b4fd70373e9e6098) by sketchlabkaist (https://sketchfab.com/sketchlabkaist) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

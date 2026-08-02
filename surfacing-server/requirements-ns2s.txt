@@ -1,0 +1,29 @@
+# Environment for the NeuralSketch2Surf adapter (methods/NeuralSketch2Surf),
+# separate from the server env and from .venv-vns (their torch pins differ).
+# Install torch FIRST from the ROCm index (AMD GPU), then the rest:
+#   python3 -m venv .venv-ns2s
+#   .venv-ns2s/bin/pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/rocm6.4
+#   .venv-ns2s/bin/pip install -r requirements-ns2s.txt
+#
+# The upstream requirements.txt in the submodule pins torch from the CUDA
+# index and pulls in the training/visualisation stack (wandb, weave, plotly,
+# matplotlib, polyscope, open3d). None of that is needed for inference, so
+# this is the trimmed inference-only set.
+#
+# The checkpoint is NOT in the repo — download best_model_jit.pt from
+#   https://huggingface.co/HongshengY/S2V_Net
+# into methods/NeuralSketch2Surf/checkpoints/ (or set NS2S_CHECKPOINT).
+
+# inference.py imports train112TVloss for SwinReconstructionModule, which
+# drags in lightning + monai even when loading the TorchScript checkpoint
+pytorch-lightning
+monai
+# numpy<2: matches the upstream pin (1.26.4); the vendored SwinUNETR and
+# scikit-image build against numpy 1.x here
+numpy<2
+scipy
+scikit-image
+trimesh
+# smooth.py (the fidelity-vs-smoothness post-process) only; the adapter runs
+# it headlessly, so polyscope is deliberately absent
+libigl

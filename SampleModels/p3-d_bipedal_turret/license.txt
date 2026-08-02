@@ -1,0 +1,11 @@
+Model Information:
+* title:	P3-D Bipedal turret
+* source:	https://sketchfab.com/3d-models/p3-d-bipedal-turret-9355ee9541784c868346d68238f5acf5
+* author:	sketchlabkaist (https://sketchfab.com/sketchlabkaist)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "P3-D Bipedal turret" (https://sketchfab.com/3d-models/p3-d-bipedal-turret-9355ee9541784c868346d68238f5acf5) by sketchlabkaist (https://sketchfab.com/sketchlabkaist) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

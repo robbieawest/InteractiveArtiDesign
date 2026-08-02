@@ -1,0 +1,11 @@
+Model Information:
+* title:	P4-E Exoskeleton armor
+* source:	https://sketchfab.com/3d-models/p4-e-exoskeleton-armor-968ff23e7b2e4f4c850895cf0e7232ae
+* author:	sketchlabkaist (https://sketchfab.com/sketchlabkaist)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "P4-E Exoskeleton armor" (https://sketchfab.com/3d-models/p4-e-exoskeleton-armor-968ff23e7b2e4f4c850895cf0e7232ae) by sketchlabkaist (https://sketchfab.com/sketchlabkaist) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

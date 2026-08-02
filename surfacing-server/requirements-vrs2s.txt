@@ -1,0 +1,29 @@
+# VRSketch2Shape (methods/VRSketch2Shape) — inference only.
+#
+# The upstream environment.yml is a full conda export of a training+evaluation
+# setup: pytorch3d, open3d, wandb, torchserve, the lot. Generating a shape from
+# one sketch needs none of it, and pytorch3d in particular has no ROCm build
+# worth fighting — headless.py extracts the mesh with PyMCubes instead.
+#
+# torch is installed separately (ROCm wheels come from their own index):
+#   .venv-vrs2s/bin/pip install torch==2.8.0 torchvision \
+#       --index-url https://download.pytorch.org/whl/rocm6.4
+
+# the BERT stroke encoder is transformers' BertEncoder/BertConfig; 4.49 is what
+# the checkpoint was trained against
+transformers==4.49.0
+omegaconf==2.3.0
+einops
+termcolor
+tqdm
+
+# stroke preprocessing: polyline decimation before tokenizing
+simplifyline==0.0.7
+
+# 64**3 SDF -> mesh
+PyMCubes==0.1.6
+trimesh
+
+# imported at module scope by code we go through, unused on the inference path
+h5py
+matplotlib

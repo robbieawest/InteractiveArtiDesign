@@ -1,0 +1,24 @@
+# NeuVAS (methods/NeuVAS) — surface construction only.
+#
+# torch is installed separately (ROCm wheels come from their own index):
+#   .venv-neuvas/bin/pip install torch==2.8.0 \
+#       --index-url https://download.pytorch.org/whl/rocm6.4
+#
+# Note the CUDA extension vendored under code/reconstruction/frnn is NOT built:
+# it is only imported by utils/point_processing.py, which the reconstruction
+# path never touches.
+
+numpy<2
+scipy
+trimesh
+# the .conf format the network/loss settings live in
+pyhocon
+# imported at module scope by the trainer
+GPUtil
+sympy
+# marching cubes and mesh export for the snapshot meshes
+scikit-image
+PyMCubes
+# plots.py builds plotly figures even when only the .ply is wanted
+plotly
+tqdm

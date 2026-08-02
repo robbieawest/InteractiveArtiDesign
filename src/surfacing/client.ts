@@ -27,6 +27,36 @@ export interface JobStatus {
   progress: number;
   message: string;
   error: string | null;
+  /** How many finished pieces the adapter has published so far; a cursor for
+   *  /partials, absent on older servers. */
+  partialCount?: number;
+  /** Where the server wrote the result, when the job carried a save target. */
+  savedPath?: string | null;
+}
+
+/** Tells the server to write a finished result to
+ *  benchmarks/<benchmarkId>/<adapter>/<run>/<sketch>.glb itself, so results
+ *  outlive the tab and never round-trip through the client. */
+export interface SaveTarget {
+  benchmarkId: string;
+  adapter: string;
+  run: string;
+  sketch: string;
+}
+
+export interface SurfaceJobOptions {
+  method: string;
+  sketch: SurfacingSketch;
+  options?: Record<string, unknown>;
+  save?: SaveTarget;
+  onProgress?: (status: JobStatus) => void;
+  onLog?: (lines: string[]) => void;
+  /** A part that has finished while the rest of the job continues. Awaited,
+   *  so a handler that parses the glb sees the pieces strictly in order. */
+  onPartial?: (name: string, glb: ArrayBuffer) => void | Promise<void>;
+  /** Abort polling. The server-side job keeps running — this only detaches
+   *  the client, which is what closing a window should do. */
+  signal?: AbortSignal;
 }
 
 export function buildSurfacingSketch(doc: SketchDocument): SurfacingSketch {
@@ -87,40 +117,71 @@ export async function fetchMethods(): Promise<MethodInfo[]> {
   return ((await response.json()) as { methods: MethodInfo[] }).methods;
 }
 
-/** Submit a job and poll it to completion; resolves with the result glb.
- *  `onLog` receives batches of free-form adapter log lines as they appear. */
-export async function surfaceSketch(
-  method: string,
-  sketch: SurfacingSketch,
-  options: Record<string, unknown> = {},
-  onProgress?: (status: JobStatus) => void,
-  onLog?: (lines: string[]) => void,
+/** The full job lifecycle: submit, poll, stream logs and finished parts, and
+ *  resolve with the result glb. */
+export async function runSurfacingJob(
+  opts: SurfaceJobOptions,
 ): Promise<ArrayBuffer> {
+  const { method, sketch, options = {}, save, signal } = opts;
   const created = await request("/api/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ method, sketch, options }),
+    body: JSON.stringify({ method, sketch, options, save }),
   });
   const { jobId } = (await created.json()) as { jobId: string };
 
+  // Aborting used to detach the client and leave the method running — hours
+  // of GPU work with nobody waiting for it. Now the abort takes the job with
+  // it: the server kills the method's processes and every resident worker,
+  // so Stop actually frees the card. Fire-and-forget, and idempotent server
+  // side, because nothing here may wait on (or fail because of) the cancel.
+  let cancelSent = false;
+  const cancel = () => {
+    if (cancelSent) return;
+    cancelSent = true;
+    void fetch(`/api/jobs/${jobId}/cancel`, { method: "POST" }).catch(() => {});
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel(); // aborted between submit and listener
+
   let logCursor = 0;
   const pullLog = async () => {
-    if (!onLog) return;
+    if (!opts.onLog) return;
     const { lines, next } = (await (
       await request(`/api/jobs/${jobId}/log?after=${logCursor}`)
     ).json()) as { lines: string[]; next: number };
     logCursor = next;
-    if (lines.length > 0) onLog(lines);
+    if (lines.length > 0) opts.onLog(lines);
+  };
+
+  // partials are fetched one blob at a time, so a caller that ignores them
+  // (the Surfacer panel) never pays for the bytes
+  let partialCursor = 0;
+  const pullPartials = async (status: JobStatus) => {
+    if (!opts.onPartial) return;
+    if ((status.partialCount ?? 0) <= partialCursor) return;
+    const { names } = (await (
+      await request(`/api/jobs/${jobId}/partials?after=${partialCursor}`)
+    ).json()) as { names: string[]; next: number };
+    for (const name of names) {
+      const index = partialCursor++;
+      const glb = await (
+        await request(`/api/jobs/${jobId}/partials/${index}`)
+      ).arrayBuffer();
+      await opts.onPartial(name, glb);
+    }
   };
 
   try {
     for (;;) {
       await delay(500);
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
       const status = (await (
         await request(`/api/jobs/${jobId}`)
       ).json()) as JobStatus;
-      onProgress?.(status);
+      opts.onProgress?.(status);
       await pullLog();
+      await pullPartials(status);
       if (status.status === "done") {
         return (await request(`/api/jobs/${jobId}/result`)).arrayBuffer();
       }
@@ -129,6 +190,7 @@ export async function surfaceSketch(
       }
     }
   } finally {
+    signal?.removeEventListener("abort", cancel);
     // catch log lines emitted between the last poll and the terminal state
     await pullLog().catch(() => {});
   }

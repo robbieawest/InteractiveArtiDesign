@@ -1,0 +1,11 @@
+Model Information:
+* title:	P1-C Lunar rover
+* source:	https://sketchfab.com/3d-models/p1-c-lunar-rover-a7bd0e17b29449a090fab2807fc274ff
+* author:	sketchlabkaist (https://sketchfab.com/sketchlabkaist)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "P1-C Lunar rover" (https://sketchfab.com/3d-models/p1-c-lunar-rover-a7bd0e17b29449a090fab2807fc274ff) by sketchlabkaist (https://sketchfab.com/sketchlabkaist) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

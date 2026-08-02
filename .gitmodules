@@ -1,3 +1,15 @@
 [submodule "surfacing-server/methods/vns"]
 	path = surfacing-server/methods/vns
 	url = https://github.com/robbieawest/Variational-Neural-Surfacing-of-3D-Sketches.git
+[submodule "surfacing-server/methods/NeuralSketch2Surf"]
+	path = surfacing-server/methods/NeuralSketch2Surf
+	url = https://github.com/robbieawest/NeuralSketch2Surf
+[submodule "surfacing-server/methods/VRSketch2Shape"]
+	path = surfacing-server/methods/VRSketch2Shape
+	url = https://github.com/robbieawest/VRSketch2Shape
+[submodule "surfacing-server/methods/NeuVAS"]
+	path = surfacing-server/methods/NeuVAS
+	url = https://github.com/robbieawest/NeuVAS
+[submodule "surfacing-server/methods/surface-fitting-3d-sketches"]
+	path = surfacing-server/methods/surface-fitting-3d-sketches
+	url = https://github.com/robbieawest/surface-fitting-3d-sketches

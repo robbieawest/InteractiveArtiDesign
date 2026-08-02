@@ -4,7 +4,7 @@ from typing import Any, Optional
 import numpy as np
 import trimesh
 
-from .base import LogFn, ProgressFn, SurfacingAdapter
+from .base import EmitFn, LogFn, ProgressFn, SurfacingAdapter
 
 
 class BBoxAdapter(SurfacingAdapter):
@@ -14,6 +14,7 @@ class BBoxAdapter(SurfacingAdapter):
     glb node per part)."""
 
     name = "bbox"
+    uses_gpu = False
 
     params = [
         {
@@ -34,6 +35,7 @@ class BBoxAdapter(SurfacingAdapter):
         options: dict[str, Any],
         report: ProgressFn,
         log: LogFn,
+        emit: EmitFn,
     ) -> bytes:
         part_names = {p["id"]: p["name"] for p in sketch.get("parts", [])}
         groups: dict[Optional[str], list[np.ndarray]] = {}
@@ -61,6 +63,7 @@ class BBoxAdapter(SurfacingAdapter):
             box = trimesh.creation.box(bounds=np.array([lo - pad, hi + pad]))
             box.visual.face_colors = [255, 170, 60, 140]
             scene.add_geometry(box, node_name=name, geom_name=name)
+            emit(name, box.export(file_type="glb"))
 
         report(1.0, "exporting")
         return scene.export(file_type="glb")

@@ -1,7 +1,24 @@
 <template>
   <div class="panels">
+    <!-- Benchmark is a header only: it opens a full-screen window rather than
+         expanding in place, since a grid of sketches needs the whole screen. -->
+    <div class="panel">
+      <button
+        class="panel-header"
+        title="Standardized surfacing comparison — run adapters and parameter permutations over a folder of sketches"
+        @click="$emit('open-benchmark')"
+      >
+        <span>Benchmark</span>
+        <span class="chevron">⤢</span>
+      </button>
+    </div>
+
     <div v-for="panel in panels" :key="panel" class="panel">
-      <div v-if="expanded === panel" class="panel-body">
+      <div
+        v-if="expanded === panel"
+        class="panel-body"
+        :class="{ 'panel-body-tall': panel === 'surfacer' }"
+      >
         <!-- Parts -->
         <template v-if="panel === 'parts'">
           <div v-if="parts.length === 0" class="empty">
@@ -372,6 +389,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "set-expanded": [panel: PanelName | null];
+  "open-benchmark": [];
   "set-active-part": [partId: string];
   "add-part": [];
   "remove-part": [partId: string];
@@ -491,19 +509,28 @@ const headerTooltips: Record<PanelName, string> = {
 .panels {
   position: absolute;
   right: 12px;
+  /* spans the viewport so a tall panel is clamped by it instead of running off
+     the top of the screen; the strip itself is click-through, only the panels
+     take pointer events */
+  top: 60px; /* clear of the right-hand toolbar */
   bottom: 12px;
   display: flex;
   flex-direction: column;
+  justify-content: flex-end;
   gap: 8px;
   width: 260px;
+  pointer-events: none;
 }
 
 .panel {
   display: flex;
   flex-direction: column;
+  min-height: 0; /* let the stack shrink this panel when space runs out */
+  pointer-events: auto;
 }
 
 .panel-header {
+  flex: none;
   height: 36px;
   padding: 0 16px;
   border: none;
@@ -531,11 +558,18 @@ const headerTooltips: Record<PanelName, string> = {
   margin-bottom: 6px;
   padding: 10px;
   max-height: 40vh;
+  min-height: 0;
   overflow-y: auto;
   filter: drop-shadow(0 0 12px rgba(0, 0, 0, 0.12));
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* the surfacer panel is the one you drag taller (the log), so it gets more
+   room than a list panel before it starts scrolling internally */
+.panel-body-tall {
+  max-height: 82vh;
 }
 
 .empty {
@@ -766,6 +800,13 @@ const headerTooltips: Record<PanelName, string> = {
 
 .surf-log {
   height: 130px;
+  /* drag the corner to make room for a chatty adapter. flex: none is what
+     makes the drag stick: as a flex child in the panel's column it would
+     otherwise be shrunk straight back to fit the body's max-height */
+  resize: vertical;
+  flex: none;
+  min-height: 48px;
+  max-height: 70vh;
   margin: 0;
   padding: 8px;
   border-radius: 8px;

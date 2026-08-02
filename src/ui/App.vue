@@ -249,7 +249,30 @@
     @set-surface-opacity="setSurfaceOpacity"
     @surface="runSurfacing"
     @clear-surface="clearSurface"
+    @open-benchmark="benchmarkOpen = true"
   />
+
+  <BenchmarkWindow
+    v-if="benchmarkOpen"
+    @close="benchmarkOpen = false"
+    @open="openBenchmarkSketch"
+  />
+
+  <!-- an edit session borrows the whole editor, so it needs a way back -->
+  <div v-if="editingBenchmarkSketch" class="benchmark-edit-bar">
+    <span>
+      Editing benchmark sketch <strong>{{ editingBenchmarkSketch }}</strong>
+    </span>
+    <button
+      title="Save the edited sketch back into the benchmark, in its current pose. Any surfaces already made from it are discarded, since they no longer match."
+      @click="saveBenchmarkEdit"
+    >
+      Save to benchmark
+    </button>
+    <button title="Leave the benchmark's copy untouched" @click="cancelBenchmarkEdit">
+      Discard
+    </button>
+  </div>
 
   <div
     v-if="resetDialogOpen"
@@ -287,6 +310,9 @@ import { ArticulateTool } from "../tools/ArticulateTool";
 import { JointTool } from "../tools/JointTool";
 import { ExplodeTool } from "../tools/ExplodeTool";
 import BottomPanels, { type PanelName } from "./BottomPanels.vue";
+import BenchmarkWindow from "./BenchmarkWindow.vue";
+import * as benchmark from "../benchmark/store";
+import { readSketch } from "../surfacing/benchmarkClient";
 import { SketchDocument } from "../core/SketchDocument";
 import {
   UndoStack,
@@ -305,7 +331,7 @@ import { SurfacePreview } from "../engine/SurfacePreview";
 import {
   buildSurfacingSketch,
   fetchMethods,
-  surfaceSketch,
+  runSurfacingJob,
   type MethodInfo,
   type MethodOptions,
 } from "../surfacing/client";
@@ -361,6 +387,9 @@ const fillColor = ref("#1c1c1e");
 const canUndo = ref(false);
 const canRedo = ref(false);
 const resetDialogOpen = ref(false);
+// the window is a view onto the benchmark store; closing it stops nothing
+const benchmarkOpen = ref(false);
+const editingBenchmarkSketch = computed(() => benchmark.state.editing);
 
 // surfacing job state (the mesh itself lives in SurfacePreview, not here)
 const surfacingBusy = ref(false);
@@ -738,18 +767,33 @@ async function runSurfacing(): Promise<void> {
   surfacingBusy.value = true;
   surfacingProgress.value = 0;
   surfacingLog.value = [];
+  // the previous surface stays up until this job has something of its own to
+  // show, so a job that fails before producing anything costs nothing
+  let showingPartials = false;
   try {
-    const glb = await surfaceSketch(
+    const glb = await runSurfacingJob({
       method,
-      buildSurfacingSketch(doc),
-      { ...surfacingOptions.value[method] },
-      (status) => (surfacingProgress.value = status.progress),
-      (lines) => {
+      sketch: buildSurfacingSketch(doc),
+      options: { ...surfacingOptions.value[method] },
+      onProgress: (status) => (surfacingProgress.value = status.progress),
+      onLog: (lines) => {
         surfacingLog.value = [...surfacingLog.value, ...lines].slice(
           -SURFACING_LOG_CAP,
         );
       },
-    );
+      // adapters that publish parts as they finish render straight into the
+      // viewport; the final result below supersedes the lot
+      onPartial: async (name, partial) => {
+        if (!surfacePreview) return;
+        if (!showingPartials) {
+          showingPartials = true;
+          clearSurface();
+        }
+        await surfacePreview.showPartial(name, partial);
+        hasSurface.value = true;
+        surfaceVisible.value = true;
+      },
+    });
     await surfacePreview.show(glb);
     // record the result first, so a later skinning hiccup can never lose the
     // mesh from saves (the glb is what rides along in the .json)
@@ -1009,6 +1053,83 @@ function loadFile(): void {
   };
   input.click();
 }
+
+/** Open one of a benchmark's stored sketches in the editor.
+ *
+ *  The benchmark itself is untouched: its state and its jobs live in the
+ *  store, not in the window, so surfacing carries on while you look around
+ *  (and the window reopens exactly where it was). In edit mode the sketch
+ *  comes back through `saveBenchmarkEdit`; otherwise this is just a look. */
+async function openBenchmarkSketch(name: string): Promise<void> {
+  const benchmarkId = benchmark.state.id;
+  if (!benchmarkId) return;
+  try {
+    const json = await readSketch(benchmarkId, name);
+    selectTool?.deselect();
+    clearSurface();
+    doc.clear();
+    undoStack.clear();
+    activePartId.value = null;
+    segmentTool?.setActivePart(undefined);
+    const loaded = deserializeDocument(json);
+    for (const part of loaded.allParts()) doc.addPart(part);
+    for (const pose of loaded.allPoses()) doc.addPose(pose);
+    for (const joint of loaded.allJoints()) doc.addJoint(joint);
+    doc.exploded = loaded.exploded;
+    for (const stroke of loaded.allStrokes()) doc.addStroke(stroke);
+    partCounter = loaded.allParts().length;
+    syncExplodeMode();
+
+    if (benchmark.state.editMode) {
+      benchmark.beginEdit(name);
+      benchmarkOpen.value = false;
+      return; // no surface overlay: the point is to see and change the strokes
+    }
+
+    // the viewed run's finished surface, read from disk on demand — the
+    // benchmark holds no meshes in memory to hand over
+    const bytes = await benchmark.readViewedSurface(name);
+    if (bytes && surfacePreview) {
+      await surfacePreview.show(bytes.slice(0)); // parse a throwaway copy
+      surfaceGlb = { method: benchmark.state.viewing?.adapter ?? "", bytes };
+      hasSurface.value = true;
+      surfaceVisible.value = true;
+      surfacePreview.setStyle({
+        color: surfaceColor.value,
+        opacity: surfaceOpacity.value,
+      });
+      // the sketch carries its joints, so bind the overlay to the rig here as
+      // well — otherwise a benchmark surface sits still while the strokes move
+      bindSurfaceSkin();
+    }
+    benchmarkOpen.value = false;
+  } catch (error) {
+    alert(`Could not open benchmark sketch: ${error}`);
+  }
+}
+
+/** Write the edited document back into the benchmark's sketches/ folder.
+ *
+ *  Articulation travels with it: strokes always hold absolute transforms, so
+ *  a sketch saved while posed is stored posed, and that is the geometry the
+ *  next run surfaces. Only the cached surface is dropped — it belongs to the
+ *  strokes as they were, not as they are. */
+async function saveBenchmarkEdit(): Promise<void> {
+  const name = benchmark.state.editing;
+  if (!name) return;
+  try {
+    const json = serializeDocument(doc);
+    await benchmark.saveEdit(name, { ...json, surface: undefined });
+    benchmarkOpen.value = true;
+  } catch (error) {
+    alert(`Could not save benchmark sketch: ${error}`);
+  }
+}
+
+function cancelBenchmarkEdit(): void {
+  benchmark.cancelEdit();
+  benchmarkOpen.value = true;
+}
 </script>
 
 <style scoped>
@@ -1099,6 +1220,22 @@ function loadFile(): void {
   width: 1px;
   height: 24px;
   background: rgba(0, 0, 0, 0.15);
+}
+
+.benchmark-edit-bar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  font-size: 12px;
+  background: #f0ebfa;
+  border: 1px solid #7b4bd8;
+  border-radius: 4px;
+  z-index: 20;
 }
 
 .modal-backdrop {

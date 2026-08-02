@@ -5,6 +5,11 @@ from typing import Any, Callable
 ProgressFn = Callable[..., None]
 # log(line) — free-form text streamed to the client's log window
 LogFn = Callable[[str], None]
+# emit(name, glb) — a piece of the result that is already final (typically one
+# part), published while the job keeps running so the client can show geometry
+# before the whole thing is done. Optional: a method with nothing meaningful to
+# show until the end simply never calls it.
+EmitFn = Callable[[str, bytes], None]
 
 
 class SurfacingAdapter(ABC):
@@ -14,6 +19,12 @@ class SurfacingAdapter(ABC):
     method output → glb. This server's own environment stays torch-free."""
 
     name: str
+
+    # Whether running this method needs the GPU. A GPU method evicts every
+    # other method's resident worker before it starts (see
+    # `common.release_other_workers`); a CPU-only one leaves them alone, so a
+    # trivial run never costs a benchmark its warm worker.
+    uses_gpu: bool = True
 
     # User-editable parameters, rendered generically by the Surfacer panel
     # and passed back (by `name`) inside the job's `options` dict. Each spec:
@@ -31,7 +42,10 @@ class SurfacingAdapter(ABC):
         options: dict[str, Any],
         report: ProgressFn,
         log: LogFn,
+        emit: EmitFn,
     ) -> bytes:
         """Run the method to completion and return a binary glTF (.glb).
         Called on a worker thread. `report(progress, message)` drives the
-        progress bar; `log(line)` streams any text to the UI log window."""
+        progress bar; `log(line)` streams any text to the UI log window;
+        `emit(name, glb)` publishes a finished piece of the result (a part)
+        while the rest is still running."""
