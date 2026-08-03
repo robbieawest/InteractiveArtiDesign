@@ -164,6 +164,43 @@ def save_result(
     return path
 
 
+def part_dir(benchmark_id: str, adapter: str, run: str, sketch: str) -> Path:
+    """Where one cell's per-part surfaces live, when the cell was split across
+    cluster tasks: <bench>/<adapter>/<run>/<sketch>/ — a sibling of the merged
+    <sketch>.glb rather than a replacement for it, so the client keeps reading
+    the same path it always has."""
+    return (
+        bench_dir(benchmark_id)
+        / _safe(adapter, "adapter name")
+        / _safe(run, "run name")
+        / _safe(sketch, "sketch name")
+    )
+
+
+def save_part_result(
+    benchmark_id: str, adapter: str, run: str, sketch: str, part: str, glb: bytes
+) -> Path:
+    """Write one part's surface. `part` is an ordinal like `part_07`, not the
+    part's name: names are user-authored ("Part 1" — a space) and ids are
+    nanoids that may lead with `-`, so neither survives `_safe`. The ordinal to
+    id/name mapping is recorded in the sidecar written beside it."""
+    path = part_dir(benchmark_id, adapter, run, sketch) / f"{_safe(part, 'part name')}.glb"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(glb)
+    return path
+
+
+def list_part_results(
+    benchmark_id: str, adapter: str, run: str, sketch: str
+) -> list[Path]:
+    """This cell's finished parts, in ordinal order. Empty when the cell was
+    never split, or split but nothing succeeded."""
+    directory = part_dir(benchmark_id, adapter, run, sketch)
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob("part_*.glb"))
+
+
 def read_result(benchmark_id: str, adapter: str, run: str, sketch: str) -> bytes:
     path = (
         bench_dir(benchmark_id)

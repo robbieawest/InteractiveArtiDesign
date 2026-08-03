@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "Scheduling policy only — never benchmark configuration. What runs is",
+    "decided entirely by the benchmark's progress.json; this file only says",
+    "what resources to ask Slurm for.",
+    "",
+    "  split    prefer one task per part where the run allows it. It only",
+    "           takes effect when that run's own options say part_based:true;",
+    "           a whole-object run is always a single task.",
+    "  time     Slurm --time. Teaching's ceiling is 2-00:00:00.",
+    "  gres     Slurm --gres value. Note the 2080 Ti pool is 11GB, which is",
+    "           under both the ~13GB ns2s resident worker and VNS's measured",
+    "           12.4GB, so those need the H200 slices or the A6000s.",
+    "  throttle max concurrent tasks (the %N on --array).",
+    "",
+    "An adapter with no entry here uses 'default', so a benchmark naming an",
+    "adapter this file has never heard of still schedules."
+  ],
+
+  "default": {
+    "split": true,
+    "time": "04:00:00",
+    "gres": "h200_1g.18gb:1",
+    "throttle": 16
+  },
+
+  "ns2s": {
+    "split": false,
+    "time": "01:00:00",
+    "gres": "h200_1g.18gb:1",
+    "throttle": 16,
+    "why": "seconds per part; splitting would cost more in scheduling than it saves"
+  },
+  "sf3d": {
+    "split": true,
+    "time": "06:00:00",
+    "gres": "h200_1g.18gb:1",
+    "throttle": 16,
+    "why": "runs its proxy adapter on the GPU in-process, so it needs a card despite uses_gpu=False"
+  },
+  "vns": {
+    "split": true,
+    "time": "08:00:00",
+    "gres": "nvidia_rtx_a6000:1",
+    "throttle": 8,
+    "why": "12.4GB measured; full Ampere cards beat 1/7 H200 slices for a long compute-bound loop"
+  },
+  "neuvas": {
+    "split": true,
+    "time": "08:00:00",
+    "gres": "nvidia_rtx_a6000:1",
+    "throttle": 8
+  }
+}

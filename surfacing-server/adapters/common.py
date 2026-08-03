@@ -16,7 +16,12 @@ from .base import LogFn
 
 SERVER_DIR = Path(__file__).resolve().parent.parent
 METHODS_DIR = SERVER_DIR / "methods"
-JOBS_DIR = SERVER_DIR / "jobs"
+# scratch root for method intermediates. Overridable because on a cluster each
+# task needs its own directory on node-local disk (/disk/scratch/...): two
+# array tasks sharing one root would prune each other's working files, and the
+# traffic — 275MB for a part-based sf3d run — has no business on a network
+# filesystem.
+JOBS_DIR = Path(os.environ.get("SURFACING_JOBS_DIR", SERVER_DIR / "jobs"))
 
 # AMD GPU (ROCm): the user's defines, which must be set before any torch code
 # runs. Anything already exported in the calling environment wins — spread
@@ -29,8 +34,13 @@ ROCM_ENV: dict[str, str] = {
 
 def method_env() -> dict[str, str]:
     """Environment for a method subprocess: the ROCm defines, overridable by
-    whatever the server itself was started with."""
-    return {**ROCM_ENV, **os.environ}
+    whatever the server itself was started with.
+
+    SURFACING_GPU_BACKEND=cuda drops the ROCm defines entirely — on an NVIDIA
+    machine HSA_OVERRIDE_GFX_VERSION is meaningless and HIP_VISIBLE_DEVICES
+    is actively misleading next to the CUDA_VISIBLE_DEVICES Slurm sets."""
+    base = {} if os.environ.get("SURFACING_GPU_BACKEND") == "cuda" else ROCM_ENV
+    return {**base, **os.environ}
 
 
 # how long to wait for an evicted worker to exit before killing it. It only
