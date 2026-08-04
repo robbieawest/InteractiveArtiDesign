@@ -1,0 +1,46 @@
+{
+ "adapter": "ns2s",
+ "run": "run-2",
+ "sketch": "p3-c_spacecraft",
+ "part": "-",
+ "partId": "-",
+ "options": {
+  "part_based": true,
+  "threshold": 0.6,
+  "margin": 1.2,
+  "smooth": false,
+  "smoothness": 0.5
+ },
+ "state": "done",
+ "seconds": 30.3,
+ "parts": [
+  "Part 3",
+  "Part 4",
+  "Part 13",
+  "Part 2",
+  "Part 5",
+  "Part 6",
+  "Part 7",
+  "Part 8",
+  "Part 9",
+  "Part 10",
+  "Part 11",
+  "Part 12"
+ ],
+ "partFiles": {
+  "Part 3": "00_Part_3.glb",
+  "Part 4": "01_Part_4.glb",
+  "Part 13": "02_Part_13.glb",
+  "Part 2": "03_Part_2.glb",
+  "Part 5": "04_Part_5.glb",
+  "Part 6": "05_Part_6.glb",
+  "Part 7": "06_Part_7.glb",
+  "Part 8": "07_Part_8.glb",
+  "Part 9": "08_Part_9.glb",
+  "Part 10": "09_Part_10.glb",
+  "Part 11": "10_Part_11.glb",
+  "Part 12": "11_Part_12.glb"
+ },
+ "bytes": 2594432,
+ "unionFailed": false
+}

@@ -1,0 +1,34 @@
+{
+ "adapter": "ns2s",
+ "run": "run-2",
+ "sketch": "p1-b_self-driving_shuttle",
+ "part": "-",
+ "partId": "-",
+ "options": {
+  "part_based": true,
+  "threshold": 0.6,
+  "margin": 1.2,
+  "smooth": false,
+  "smoothness": 0.5
+ },
+ "state": "done",
+ "seconds": 238.3,
+ "parts": [
+  "Part 5",
+  "Part 4",
+  "Part 3",
+  "Part 6",
+  "Part 7",
+  "Part 2"
+ ],
+ "partFiles": {
+  "Part 5": "00_Part_5.glb",
+  "Part 4": "01_Part_4.glb",
+  "Part 3": "02_Part_3.glb",
+  "Part 6": "03_Part_6.glb",
+  "Part 7": "04_Part_7.glb",
+  "Part 2": "05_Part_2.glb"
+ },
+ "bytes": 5472616,
+ "unionFailed": false
+}

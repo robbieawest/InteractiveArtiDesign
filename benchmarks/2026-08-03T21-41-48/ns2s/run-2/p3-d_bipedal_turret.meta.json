@@ -1,0 +1,44 @@
+{
+ "adapter": "ns2s",
+ "run": "run-2",
+ "sketch": "p3-d_bipedal_turret",
+ "part": "-",
+ "partId": "-",
+ "options": {
+  "part_based": true,
+  "threshold": 0.6,
+  "margin": 1.2,
+  "smooth": false,
+  "smoothness": 0.5
+ },
+ "state": "done",
+ "seconds": 32.8,
+ "parts": [
+  "Part 5",
+  "Part 4",
+  "Part 1",
+  "Part 3",
+  "Part 2",
+  "Part 9",
+  "Part 8",
+  "Part 7",
+  "Part 6",
+  "Part 11",
+  "Part 10"
+ ],
+ "partFiles": {
+  "Part 5": "00_Part_5.glb",
+  "Part 4": "01_Part_4.glb",
+  "Part 1": "02_Part_1.glb",
+  "Part 3": "03_Part_3.glb",
+  "Part 2": "04_Part_2.glb",
+  "Part 9": "05_Part_9.glb",
+  "Part 8": "06_Part_8.glb",
+  "Part 7": "07_Part_7.glb",
+  "Part 6": "08_Part_6.glb",
+  "Part 11": "09_Part_11.glb",
+  "Part 10": "10_Part_10.glb"
+ },
+ "bytes": 7837744,
+ "unionFailed": false
+}

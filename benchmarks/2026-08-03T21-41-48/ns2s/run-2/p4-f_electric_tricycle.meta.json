@@ -1,0 +1,32 @@
+{
+ "adapter": "ns2s",
+ "run": "run-2",
+ "sketch": "p4-f_electric_tricycle",
+ "part": "-",
+ "partId": "-",
+ "options": {
+  "part_based": true,
+  "threshold": 0.6,
+  "margin": 1.2,
+  "smooth": false,
+  "smoothness": 0.5
+ },
+ "state": "done",
+ "seconds": 20.6,
+ "parts": [
+  "Part 4",
+  "Part 6",
+  "Part 5",
+  "Part 2",
+  "Part 3"
+ ],
+ "partFiles": {
+  "Part 4": "00_Part_4.glb",
+  "Part 6": "01_Part_6.glb",
+  "Part 5": "02_Part_5.glb",
+  "Part 2": "03_Part_2.glb",
+  "Part 3": "04_Part_3.glb"
+ },
+ "bytes": 5168836,
+ "unionFailed": false
+}
