@@ -13,6 +13,13 @@
 set -euo pipefail
 
 BENCH="${1:?usage: finalize.sh <benchmark-id>}"
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+
+# See the note in job.sh: this runs from Slurm's spool copy, so it has to find
+# the repo through SLURM_SUBMIT_DIR rather than through its own path.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -r "$SLURM_SUBMIT_DIR/cluster/env.sh" ]]; then
+    source "$SLURM_SUBMIT_DIR/cluster/env.sh"
+else
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
+fi
 
 "$SERVER_PYTHON" "$REPO/cluster/finalize.py" "$BENCH"

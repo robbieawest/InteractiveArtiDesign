@@ -12,6 +12,7 @@ it; finalize.py rebuilds it once at the end from what is actually on disk.
 
 import argparse
 import json
+import re
 import sys
 import time
 import traceback
@@ -30,6 +31,18 @@ from adapters import ADAPTERS  # noqa: E402
 # cell records it. Distinct from the benign "not closed volumes" message, which
 # is ordinary geometry: an open sheet is a normal surfacing result.
 UNION_FAILED = "boolean union failed"
+
+
+def part_file_name(index: int, name: str) -> str:
+    """`03_left_wheel.glb` for an emitted piece called "left wheel".
+
+    The label is the part's user-authored name, so it can hold spaces, slashes
+    or a leading dash; the ordinal makes the file sort and be unique whatever
+    the slug collapses to. Deliberately not `part_NN.glb`: that name belongs to
+    a cell split across tasks, and finalize.py merges exactly that glob.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-") or "part"
+    return f"{index:02d}_{slug}.glb"
 
 
 def meta_path(bench: str, adapter: str, run: str, sketch: str, part: str) -> Path:
@@ -95,6 +108,24 @@ def main() -> int:
     log_lines: list[str] = []
     emitted: list[str] = []
 
+    # A part-based run that was *not* split across tasks (ns2s, bbox, and
+    # anything with "split": false in profiles.json) surfaces every part inside
+    # one task and returns only the combined mesh. Its per-part meshes exist
+    # only as emit() calls — the server keeps them for the browser, and here
+    # they used to be counted and thrown away, leaving the individual parts
+    # nowhere but the task's scratch directory, which is deleted on success.
+    # So write them beside the combined result. Nothing else reads these
+    # (finalize.py merges `part_*.glb`, which these deliberately are not);
+    # they are the per-part evidence a split run gets for free.
+    #
+    # The gate is the cell shape, not the run's part_based flag: an adapter is
+    # free to emit per part without exposing that option (bbox does). A whole
+    # cell that turns out to emit a single piece is just the result under
+    # another name, and its file is removed below rather than kept as a copy.
+    persist_parts = not is_part
+    part_files: dict[str, str] = {}
+    parts_out = benchmarks.part_dir(args.bench, args.adapter, args.run, args.sketch)
+
     def report(progress_frac: float = 0.0, message: str = "") -> None:
         if message:
             print(f"[{progress_frac:5.1%}] {message}", flush=True)
@@ -104,10 +135,24 @@ def main() -> int:
         print(line, flush=True)
 
     def emit(name: str, glb: bytes) -> None:
-        # nothing polls for partials here; the names are kept because
-        # progress.json records them per cell and finalize.py restores that
+        # the names are kept because progress.json records them per cell and
+        # finalize.py restores that
         if name not in emitted:
             emitted.append(name)
+        if not persist_parts:
+            return
+        # repeated emits of one name are a refinement of that same piece (a
+        # VNS snapshot, an ns2s preview before smoothing), so the file is
+        # overwritten rather than accumulated — last write is the final one
+        path = parts_out / part_file_name(emitted.index(name), name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(glb)
+            part_files[name] = path.name
+        except OSError as exc:
+            # never fail the cell over the extra copy: the combined result is
+            # the deliverable and is written by the caller regardless
+            print(f"WARNING could not write part {name!r}: {exc}", file=sys.stderr)
 
     print(f"=== {label}")
     print(f"    options: {json.dumps(options, sort_keys=True)}")
@@ -126,6 +171,10 @@ def main() -> int:
             "state": "error",
             "seconds": round(elapsed, 1),
             "error": f"{type(exc).__name__}: {exc}",
+            # parts finished before the failure are already on disk, and are
+            # the salvage from a cell that died three parts from the end
+            "parts": emitted,
+            "partFiles": part_files,
         }
         path = meta_path(args.bench, args.adapter, args.run, args.sketch, args.part)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +183,18 @@ def main() -> int:
         return 1
 
     elapsed = time.time() - started
+
+    # one emitted piece is the whole surface under another name (vns snapshots
+    # its progress, ns2s previews the unsmoothed mesh); keeping it would just
+    # store the result twice
+    if len(part_files) == 1:
+        only = parts_out / next(iter(part_files.values()))
+        only.unlink(missing_ok=True)
+        part_files.clear()
+        try:
+            parts_out.rmdir()  # only if we created it and it is now empty
+        except OSError:
+            pass
 
     if is_part:
         out = benchmarks.save_part_result(
@@ -149,6 +210,10 @@ def main() -> int:
         "state": "done",
         "seconds": round(elapsed, 1),
         "parts": emitted,
+        # part name -> the .glb written for it beside the combined result;
+        # the names cannot be recovered from the filenames alone, since they
+        # are slugged
+        "partFiles": part_files,
         "bytes": len(glb),
         "unionFailed": degraded,
     }
@@ -166,6 +231,8 @@ def main() -> int:
             file=sys.stderr,
         )
     print(f"OK {label} in {elapsed:.1f}s -> {out}")
+    if part_files:
+        print(f"   {len(part_files)} per-part surface(s) -> {parts_out}")
     return 0
 
 

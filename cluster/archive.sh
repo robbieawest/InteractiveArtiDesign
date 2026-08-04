@@ -10,14 +10,14 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 BENCH="${1:?usage: archive.sh <benchmark-id>}"
-SRC="$REPO/benchmarks/$BENCH"
+SRC="$RESULTS_ROOT/$BENCH"
 [[ -d "$SRC" ]] || { echo "no such benchmark: $SRC" >&2; exit 1; }
 
 OUT_DIR="$REPO/cluster/archives"
 mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/$BENCH.tar.gz"
 
-tar czf "$OUT" -C "$REPO/benchmarks" "$BENCH"
+tar czf "$OUT" -C "$RESULTS_ROOT" "$BENCH"
 
 echo "wrote $OUT ($(du -h "$OUT" | cut -f1))"
 echo "  $(find "$SRC" -name '*.glb' | wc -l) surfaces, $(ls "$SRC/sketches" | wc -l) sketches"

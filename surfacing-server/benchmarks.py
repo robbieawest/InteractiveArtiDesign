@@ -18,6 +18,7 @@ whatever JSON the client hands back.
 """
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -25,7 +26,16 @@ from typing import Any, Optional
 
 SERVER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SERVER_DIR.parent
-BENCH_ROOT = REPO_ROOT / "benchmarks"
+
+# Where results live. Beside the code by default, which is what a local
+# checkout wants — but overridable, because on the cluster the code may sit
+# anywhere the bundle was unpacked (including node-local scratch, which is
+# wiped) while results must land on the user's home filesystem. cluster/env.sh
+# sets this for every job; cluster/cells.py reads the same variable so the
+# runner and the planner can never disagree about where a benchmark is.
+BENCH_ROOT = Path(
+    os.environ.get("SURFACING_BENCH_ROOT") or (REPO_ROOT / "benchmarks")
+).expanduser()
 
 # folder/file names we generate or accept; anything else is rejected rather
 # than sanitized, so a surprising name fails loudly instead of writing

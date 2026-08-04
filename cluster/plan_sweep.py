@@ -23,11 +23,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cells import (  # noqa: E402
+    BENCH_ROOT,
     REPO_ROOT,
     Cell,
     enumerate_cells,
     load_progress,
     profile_for,
+    seed_inputs,
 )
 
 
@@ -45,6 +47,12 @@ def main() -> int:
     args = ap.parse_args()
 
     profiles = json.loads(Path(args.profiles).read_text())
+
+    # done here, once, rather than in each of several hundred array tasks
+    seeded = seed_inputs(args.benchmark)
+    if seeded:
+        print(seeded)
+
     grouped = enumerate_cells(args.benchmark, profiles, args.adapter)
     if not grouped:
         print("nothing to plan: progress.json declares no runs", file=sys.stderr)
@@ -57,7 +65,8 @@ def main() -> int:
     submits: list[str] = []
 
     print(f"benchmark {args.benchmark}")
-    print(f"manifests -> {out_dir}\n")
+    print(f"manifests -> {out_dir}")
+    print(f"results   -> {BENCH_ROOT / args.benchmark}\n")
     print(f"{'adapter':10} {'runs':>5} {'tasks':>7}  {'split':<6} {'gres':<26} time")
     print("-" * 78)
 
@@ -81,28 +90,44 @@ def main() -> int:
         )
 
         throttle = profile.get("throttle", 8)
+        # --parsable prints the bare job id and nothing else, so the finalize
+        # dependency populates itself. Reading the id off the "Submitted batch
+        # job N" line by hand is how you end up with an empty --dependency=
+        # afterany: and a "Job dependency problem" rejection.
         submits.append(
-            f"sbatch -p {args.partition} --gres=gpu:{profile['gres']} "
+            f"{adapter.upper()}_ID=$(sbatch --parsable "
+            f"-p {args.partition} --gres=gpu:{profile['gres']} "
             f"-t {profile['time']} --array=0-{len(cells) - 1}%{throttle} "
-            f"cluster/job.sh {manifest.relative_to(REPO_ROOT)} {args.benchmark}"
+            f"cluster/job.sh {manifest.relative_to(REPO_ROOT)} {args.benchmark})"
         )
 
     total = sum(len(c) for c in grouped.values())
     print("-" * 78)
     print(f"{'':10} {'':>5} {total:>7}  tasks total\n")
 
-    print("# submit these, noting each job id it prints back:")
+    print("# paste these as-is — each captures its job id for the line below:")
     for line in submits:
         print(line)
+    print("echo " + " ".join(f"{a.upper()}_ID=${a.upper()}_ID" for a in grouped))
 
     ids = ":".join(f"${a.upper()}_ID" for a in grouped)
     print(
         "\n# then merge per-part results and rebuild progress.json "
-        "(CPU only, no --gres):"
+        "(CPU only, no --gres). afterany, not afterok, so a few failed cells\n"
+        "# do not block merging everything that worked:"
     )
     print(
         f"sbatch -p {args.partition} -t 00:30:00 "
         f"--dependency=afterany:{ids} cluster/finalize.sh {args.benchmark}"
+    )
+    print(
+        "\n# if the arrays have already finished, or you lost the ids, drop\n"
+        "# the dependency entirely — an empty afterany: is what Slurm rejects\n"
+        "# with 'Job dependency problem':"
+    )
+    print(
+        f"sbatch -p {args.partition} -t 00:30:00 "
+        f"cluster/finalize.sh {args.benchmark}"
     )
     return 0
 

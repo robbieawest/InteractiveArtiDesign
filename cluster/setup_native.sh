@@ -32,33 +32,31 @@ if ! command -v module >/dev/null 2>&1; then
     done
 fi
 
-if [[ -f "$SUITESPARSE_PREFIX/lib/libcholmod.so" ]]; then
-    echo "=== SuiteSparse already at $SUITESPARSE_PREFIX"
-elif command -v module >/dev/null 2>&1 &&
-     module avail suitesparse 2>&1 | grep -qi suitesparse; then
-    # a site build is preferable to ours: it is compiled against this
-    # cluster's toolchain and someone else maintains it
-    echo "=== a suitesparse module exists — prefer it:"
-    module avail suitesparse 2>&1 | grep -i suitesparse
-    echo
-    echo "    'module show <name>' prints its prefix. Then in cluster/env.sh:"
-    echo "      export SUITESPARSE_PREFIX=<that prefix>"
-    echo "    and add the matching 'module load' there too, so every job gets"
-    echo "    the same build this compiled against. Check it is visible from"
-    echo "    compute nodes as well as here — MODULEPATH can differ."
-    exit 1
+PY_VERSION="${PY_VERSION:-3.10}"
+
+if [[ -x "$DEPS_PREFIX/bin/python" && -f "$DEPS_PREFIX/lib/libcholmod.so" ]]; then
+    echo "=== deps prefix already at $DEPS_PREFIX"
+    "$DEPS_PREFIX/bin/python" --version
 else
-    echo "=== SuiteSparse -> $SUITESPARSE_PREFIX"
+    echo "=== deps prefix -> $DEPS_PREFIX  (python $PY_VERSION + SuiteSparse)"
     mkdir -p "$REPO/deps"
     if ! command -v micromamba >/dev/null; then
-        echo "--- fetching micromamba (static binary, no admin needed)"
+        echo "--- fetching micromamba (one static binary, no admin needed)"
         mkdir -p "$REPO/deps/bin"
         curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
             | tar -xj -C "$REPO/deps" bin/micromamba
         export PATH="$REPO/deps/bin:$PATH"
     fi
-    micromamba create -y -p "$SUITESPARSE_PREFIX" -c conda-forge suitesparse
+    # one prefix, both things: conda-forge is being used here only as a way to
+    # obtain an interpreter and a C library without root. The project's own
+    # environments remain pip venvs built from requirements-*.txt.
+    micromamba create -y -p "$DEPS_PREFIX" -c conda-forge \
+        "python=$PY_VERSION" suitesparse
 fi
+
+for probe in "$DEPS_PREFIX/bin/python" "$DEPS_PREFIX/lib/libcholmod.so"; do
+    [[ -e "$probe" ]] || { echo "expected $probe after create" >&2; exit 1; }
+done
 
 # conda-forge ships SuiteSparse 7.x. The ==0.4.12 pin in requirements-vns.txt
 # exists only because Ubuntu 22.04 ships 5.10, so it does not apply here.

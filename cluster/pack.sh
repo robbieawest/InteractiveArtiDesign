@@ -1,7 +1,17 @@
 #!/bin/bash
-# Bundle what the cluster needs, from your local checkout. Run locally.
+# Bundle the code the cluster needs, from your local checkout. Run locally.
 #
-#   cluster/pack.sh 2026-08-02T02-09-46
+#   cluster/pack.sh                          code only
+#   cluster/pack.sh 2026-08-02T02-09-46      code + that benchmark's inputs
+#
+# A benchmark is not part of the bundle's job. It is a self-contained folder of
+# JSON that changes on a different schedule from the code, so sending one is an
+# ordinary tar and needs nothing from this script:
+#
+#   tar czf bench.tar.gz -C benchmarks --exclude='*.glb' <benchmark-id>
+#
+# The argument form stays because sending both at once is convenient the first
+# time, when neither is on the far side yet.
 #
 # What is deliberately left out, and why:
 #   .venv, .venv-*
@@ -23,7 +33,6 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-BENCH="${1:?usage: pack.sh <benchmark-id> [more-benchmark-ids...]}"
 OUT="${OUT:-icf-bundle.tar.gz}"
 
 INCLUDE=(cluster surfacing-server)
@@ -42,11 +51,28 @@ tar czf "$OUT" \
     "${INCLUDE[@]}"
 
 echo "wrote $OUT ($(du -h "$OUT" | cut -f1))"
+if [[ $# -eq 0 ]]; then
+    echo "  code only — no benchmark inputs included"
+else
+    echo "  with inputs for: $*"
+fi
 cat <<EOF
 
-copy it up, then unpack into the path cluster/env.sh expects:
+copy it up and unpack over the repo. Unpacking on top of an existing checkout
+is the normal way to update the far side: everything in the bundle is code,
+and nothing under benchmarks/ is overwritten unless you named one.
 
   scp -o ProxyJump=\$UUN@student.ssh.inf.ed.ac.uk $OUT \$UUN@icf:~/
   ssh -J \$UUN@student.ssh.inf.ed.ac.uk \$UUN@icf
   mkdir -p ~/InteractiveArtiDesign && tar xzf ~/$OUT -C ~/InteractiveArtiDesign
 EOF
+if [[ $# -eq 0 ]]; then
+    cat <<'EOF'
+
+to send a benchmark separately (inputs only — results stay here):
+
+  tar czf bench.tar.gz -C benchmarks --exclude='*.glb' <benchmark-id>
+  scp -o ProxyJump=$UUN@student.ssh.inf.ed.ac.uk bench.tar.gz $UUN@icf:~/
+  tar xzf ~/bench.tar.gz -C ~/InteractiveArtiDesign/benchmarks
+EOF
+fi
