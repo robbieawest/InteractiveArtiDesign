@@ -103,10 +103,61 @@ export interface MethodParam {
   enabledWhen?: { param: string; equals: number | boolean | string };
 }
 
+/** How one method wants the sketch rendered for conditioning. Every field is
+ *  optional: the server sends what it cares about and the renderer
+ *  (engine/strokeViews.ts) falls back for the rest. A wire type, so it lives
+ *  here with the rest of the protocol rather than with the renderer. */
+export interface ViewSpec {
+  /** Square output edge, in pixels. */
+  size?: number;
+  /** How many angles, evenly spaced in yaw. */
+  count?: number;
+  /** Elevation of the orbit, in radians above the horizon. */
+  pitch?: number;
+  /** CSS colour string, e.g. "#dcdcdc". */
+  strokeColor?: string;
+  /** Tube radius as a fraction of the sketch's bounding radius; 0 draws
+   *  hairlines. */
+  strokeThickness?: number;
+  /** Camera pullback as a multiple of the bounding radius. */
+  margin?: number;
+}
+
+/** A method that conditions on images of the sketch declares how it wants
+ *  them rendered; the client obliges and sends the PNGs in `options.views`.
+ *  Absent for every method that consumes the strokes as geometry.
+ *
+ *  `selector` names the param that chooses between specs (a method can offer
+ *  several conditioning strategies wanting different renders); without one,
+ *  `specs["*"]` applies. A strategy that needs no images has no entry, and
+ *  nothing is rendered for it. */
+export interface MethodViewSpec {
+  selector?: string | null;
+  specs: Record<string, ViewSpec>;
+}
+
 export interface MethodInfo {
   name: string;
   params: MethodParam[];
+  viewSpec?: MethodViewSpec | null;
 }
+
+/** The spec a method's current options select, or null if it wants no
+ *  renders. Kept here rather than in the caller so every submit path — the
+ *  Surfacer panel, the benchmark runner — resolves it the same way. */
+export function viewSpecFor(
+  method: MethodInfo,
+  options: MethodOptions,
+): ViewSpec | null {
+  const declared = method.viewSpec;
+  if (!declared) return null;
+  const key = declared.selector
+    ? String(options[declared.selector])
+    : DEFAULT_VIEW_SPEC_KEY;
+  return declared.specs[key] ?? null;
+}
+
+const DEFAULT_VIEW_SPEC_KEY = "*";
 
 export type MethodOptions = Record<string, number | boolean | string>;
 

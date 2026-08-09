@@ -332,9 +332,11 @@ import {
   buildSurfacingSketch,
   fetchMethods,
   runSurfacingJob,
+  viewSpecFor,
   type MethodInfo,
   type MethodOptions,
 } from "../surfacing/client";
+import { renderConditioningViews } from "../engine/strokeViews";
 import type { JointDofName, SurfaceShape } from "../core/types";
 import { jointPosed } from "../core/types";
 
@@ -771,10 +773,34 @@ async function runSurfacing(): Promise<void> {
   // show, so a job that fails before producing anything costs nothing
   let showingPartials = false;
   try {
+    const sketch = buildSurfacingSketch(doc);
+    const options: Record<string, unknown> = {
+      ...surfacingOptions.value[method],
+    };
+
+    // Image-conditioned methods (trellis) consume renders of the sketch
+    // rather than the strokes as geometry, and declare how they want them
+    // rendered. Doing it here rather than in the adapter keeps one renderer
+    // for the whole app — the editor already owns a three.js view of the
+    // document, and a second rasterizer server-side would be another thing to
+    // keep honest about stroke width, framing and pose.
+    const info = surfacingMethods.value.find((m) => m.name === method);
+    const spec = info
+      ? viewSpecFor(info, surfacingOptions.value[method] ?? {})
+      : null;
+    if (spec) {
+      surfacingLog.value = [...surfacingLog.value, "rendering sketch views…"];
+      options.views = await renderConditioningViews(
+        sketch,
+        spec,
+        Boolean(options.part_based),
+      );
+    }
+
     const glb = await runSurfacingJob({
       method,
-      sketch: buildSurfacingSketch(doc),
-      options: { ...surfacingOptions.value[method] },
+      sketch,
+      options,
       onProgress: (status) => (surfacingProgress.value = status.progress),
       onLog: (lines) => {
         surfacingLog.value = [...surfacingLog.value, ...lines].slice(

@@ -4,6 +4,7 @@ Everything here runs in the *server* environment, so it must stay torch-free;
 the methods themselves are invoked as subprocesses in their own venvs.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -23,24 +24,74 @@ METHODS_DIR = SERVER_DIR / "methods"
 # filesystem.
 JOBS_DIR = Path(os.environ.get("SURFACING_JOBS_DIR", SERVER_DIR / "jobs"))
 
-# AMD GPU (ROCm): the user's defines, which must be set before any torch code
-# runs. Anything already exported in the calling environment wins — spread
-# os.environ after this dict, not before.
-ROCM_ENV: dict[str, str] = {
-    "HSA_OVERRIDE_GFX_VERSION": "11.0.0",
-    "HIP_VISIBLE_DEVICES": "0",
-}
+# Per-vendor settings — the defines a method subprocess needs before any torch
+# code runs, and (for setup_venvs.sh) the wheel index. One table, so the
+# runtime and the install can never disagree about which stack this machine is.
+BACKENDS_FILE = SERVER_DIR / "backends.json"
+DEFAULT_BACKEND = "rocm"
 
 
-def method_env() -> dict[str, str]:
-    """Environment for a method subprocess: the ROCm defines, overridable by
-    whatever the server itself was started with.
+def backend_name() -> str:
+    return os.environ.get("SURFACING_GPU_BACKEND") or DEFAULT_BACKEND
 
-    SURFACING_GPU_BACKEND=cuda drops the ROCm defines entirely — on an NVIDIA
-    machine HSA_OVERRIDE_GFX_VERSION is meaningless and HIP_VISIBLE_DEVICES
-    is actively misleading next to the CUDA_VISIBLE_DEVICES Slurm sets."""
-    base = {} if os.environ.get("SURFACING_GPU_BACKEND") == "cuda" else ROCM_ENV
-    return {**base, **os.environ}
+
+def backend_table() -> dict[str, Any]:
+    """This machine's entry from backends.json.
+
+    An unknown name raises rather than falling back: the previous form was
+    `{} if backend == "cuda" else ROCM_ENV`, so a typo ("cude") quietly ran the
+    ROCm defines on an NVIDIA box. Failing here costs a clear message; the
+    fallback cost an hour of wrong results.
+    """
+    name = backend_name()
+    table = json.loads(BACKENDS_FILE.read_text())
+    if name not in table or name.startswith("_"):
+        known = sorted(k for k in table if not k.startswith("_"))
+        raise KeyError(
+            f"SURFACING_GPU_BACKEND={name!r} is not in {BACKENDS_FILE.name}; "
+            f"known backends: {', '.join(known)}"
+        )
+    return table[name]
+
+
+def backend_method(method: str) -> dict[str, Any]:
+    """This backend's overrides for one method, or {} if it has none.
+
+    Only methods that are a different *codebase* per vendor need an entry —
+    `trellis`, where AMD runs the TRELLIS-AMD fork out of its own checkout and
+    venv. Everything else runs the same code either way and reads nothing here.
+    """
+    return backend_table().get("methods", {}).get(method, {})
+
+
+def resolve_path(value: str) -> Path:
+    """A path from backends.json: ~ expands, and a relative path is taken
+    against the server directory rather than the process cwd (which is
+    whatever uvicorn was started from).
+
+    Normalized textually rather than with Path.resolve(), which follows
+    symlinks: a venv's bin/python *is* a symlink to the system interpreter,
+    and resolving it hands back /usr/bin/pythonX.Y — the same binary, but
+    started outside the venv, so none of the method's packages are importable.
+    """
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = SERVER_DIR / path
+    return Path(os.path.normpath(path))
+
+
+def method_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Environment for a method subprocess: this backend's defines, then any
+    the method itself needs, overridable by whatever the server was started
+    with.
+
+    os.environ is spread *last* on purpose. The defines are defaults, not
+    policy: CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES are set per worker by
+    local/run_sweep.py (and by Slurm on the cluster), and that pinning has to
+    win over anything the table says.
+    """
+    base: dict[str, str] = backend_table().get("env", {})
+    return {**base, **(extra or {}), **os.environ}
 
 
 # how long to wait for an evicted worker to exit before killing it. It only

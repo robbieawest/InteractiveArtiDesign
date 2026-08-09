@@ -142,7 +142,13 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "methods": [
-            {"name": name, "params": ADAPTERS[name].params}
+            {
+                "name": name,
+                "params": ADAPTERS[name].params,
+                # absent for every method that consumes strokes as geometry;
+                # the client only renders views when a method asks for them
+                "viewSpec": ADAPTERS[name].view_spec,
+            }
             for name in sorted(ADAPTERS)
         ],
     }

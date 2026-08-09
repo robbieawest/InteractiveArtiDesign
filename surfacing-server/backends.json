@@ -1,0 +1,98 @@
+{
+  "_comment": [
+    "Everything that depends on which GPU vendor a machine has, in one place,",
+    "keyed by SURFACING_GPU_BACKEND. Three consumers read it:",
+    "",
+    "  adapters/common.py   `env` — defines exported into every method",
+    "                       subprocess, before any torch code runs.",
+    "  adapters/common.py   `methods.<name>` — per-method overrides for the",
+    "                       cases where a method is not one codebase but two.",
+    "                       `trellis` is the only one so far: upstream TRELLIS",
+    "                       is CUDA-only (custom kernels, xformers, flash-attn),",
+    "                       so AMD needs the TRELLIS-AMD fork — a different",
+    "                       checkout, a different venv, and HIP-only defines",
+    "                       (torchsparse instead of spconv, sdpa instead of",
+    "                       xformers). Same adapter, same parameters, same",
+    "                       results to compare; only the process differs.",
+    "  cluster/setup_venvs.sh",
+    "                       `torch_index` — the download.pytorch.org index the",
+    "                       torch wheels come from, per venv, falling back to",
+    "                       `default`. torch is installed FIRST and never",
+    "                       appears in a requirements file, so this is the only",
+    "                       thing deciding whether a venv ends up ROCm or CUDA.",
+    "",
+    "Before this file those two answers lived apart: the runtime read",
+    "SURFACING_GPU_BACKEND while the install read TORCH_INDEX/TORCH_INDEX_VNS,",
+    "typed on the command line and defaulting to ROCm. Setting the backend but",
+    "forgetting the indices installed ROCm torch on an NVIDIA machine, and",
+    "nothing failed until the first cell ran.",
+    "",
+    "`repo` and `python` under a method are resolved relative to the server",
+    "directory, and ~ expands, so a checkout outside the project can be named",
+    "without hardcoding a home directory. Both are overridable per method by",
+    "env var (TRELLIS_REPO / TRELLIS_PYTHON) for a machine that keeps them",
+    "somewhere else again.",
+    "",
+    "Device selection is deliberately NOT here. CUDA_VISIBLE_DEVICES and",
+    "HIP_VISIBLE_DEVICES are set per worker by local/run_sweep.py (and by Slurm",
+    "on the cluster); a fixed value in this table would be a stale default that",
+    "every caller has to override.",
+    "",
+    "An unknown backend is an error in every consumer rather than a fallback:",
+    "a typo silently running the wrong stack is the thing this file exists to",
+    "prevent."
+  ],
+
+  "rocm": {
+    "torch_index": {
+      "default": "rocm6.4",
+      "vns": "rocm6.2"
+    },
+    "env": {
+      "HSA_OVERRIDE_GFX_VERSION": "11.0.0"
+    },
+    "methods": {
+      "trellis": {
+        "repo": "methods/TRELLIS-AMD",
+        "python": "methods/TRELLIS-AMD/.venv/bin/python",
+        "_fill_holes": [
+          "false because the fork's simplified coarse rasterizer returns",
+          "empty visibility, so TRELLIS's fill_holes marks every face",
+          "invisible and deletes the mesh (AMD_GPU_GUIDE.md 3.3). Not a",
+          "configuration problem: nvdiffrast-hip builds and runs, the stage",
+          "itself is wrong on AMD. The adapter clears loose fragments by",
+          "component area instead, which is cruder — it cannot tell a small",
+          "part from a stray shell, only small from large."
+        ],
+        "fill_holes": false,
+        "env": {
+          "SPCONV_ALGO": "native",
+          "ATTN_BACKEND": "sdpa",
+          "XFORMERS_DISABLED": "1",
+          "SPARSE_BACKEND": "torchsparse",
+          "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+        }
+      }
+    }
+  },
+
+  "cuda": {
+    "torch_index": {
+      "default": "cu128",
+      "vns": "cu121"
+    },
+    "env": {},
+    "methods": {
+      "trellis": {
+        "repo": "methods/TRELLIS",
+        "python": "methods/TRELLIS/.venv/bin/python",
+        "fill_holes": true,
+        "env": {
+          "SPCONV_ALGO": "native",
+          "ATTN_BACKEND": "flash-attn",
+          "SPARSE_BACKEND": "spconv"
+        }
+      }
+    }
+  }
+}

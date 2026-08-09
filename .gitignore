@@ -9,3 +9,4 @@ surfacing-server/bench_vns/forks
 surfacing-server/bench_vns/results
 # surfacing benchmark output (repo root only; the VNS perf harness is bench_vns/)
 /benchmarks/
+local/logs/*.log

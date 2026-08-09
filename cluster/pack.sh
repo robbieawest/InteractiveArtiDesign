@@ -35,7 +35,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 OUT="${OUT:-icf-bundle.tar.gz}"
 
-INCLUDE=(cluster surfacing-server)
+# local/ rides along: the same sweep over the same cells, scheduled on a
+# machine's own GPUs instead of Slurm, and it imports cells.py and run_one.py
+# out of cluster/. Sending one without the other leaves a half-usable checkout,
+# and it is a few KB. The --exclude='logs/*' below already covers local/logs.
+INCLUDE=(cluster local surfacing-server)
 for bench in "$@"; do
     [[ -d "benchmarks/$bench/sketches" ]] || {
         echo "no benchmarks/$bench/sketches" >&2; exit 1; }

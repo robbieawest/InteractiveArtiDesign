@@ -441,3 +441,133 @@ list, and `mesh_optimization.minimize`, to hook L-BFGS's per-iteration
 callback. The proxy is published as soon as it is remeshed, then a snapshot
 every `snapshot_every` steps, so the surface is watchable pulling onto the
 strokes from the first second rather than after the last.
+
+### TRELLIS (`trellis`)
+
+[Xiang et al., 2024](https://trellis3d.github.io/), MIT-licensed, at
+<https://github.com/microsoft/TRELLIS>. The only *generative* method here: it
+does not fit the strokes, it samples an object conditioned on images of them.
+
+**Two checkouts, one adapter.** Upstream TRELLIS is CUDA-only (custom kernels,
+xformers, flash-attn), so an AMD machine runs the
+[TRELLIS-AMD](https://github.com/CalebisGross/TRELLIS-AMD) fork instead — a
+different repo, a different venv, HIP defines. Which one this machine uses
+comes from `backends.json` under the active `SURFACING_GPU_BACKEND`, next to
+every other vendor-dependent answer:
+
+| backend | submodule | notes |
+| --- | --- | --- |
+| `cuda` | `methods/TRELLIS` | upstream; spconv + flash-attn |
+| `rocm` | `methods/TRELLIS-AMD` | fork; torchsparse + sdpa |
+
+Both are submodules like every other method, so a machine only initializes the
+one its backend needs:
+
+```bash
+git submodule update --init surfacing-server/methods/TRELLIS-AMD   # or .../TRELLIS
+```
+
+Override either with `TRELLIS_REPO` / `TRELLIS_PYTHON`. The venv lives *inside*
+the checkout (`<repo>/.venv`), not beside the server's, because the two forks
+need incompatible torch builds — and because that keeps a 16 GB environment
+inside the submodule that owns it. The parameters, the worker protocol and the
+output are identical across the two, so results are comparable.
+
+There is nothing to `pip install -r` here — follow each repo's own setup. On
+ROCm only `torchsparse` has to build from source, and it needs an explicit
+prefix because the installer hardcodes one that may not exist:
+
+```bash
+# derive the prefix rather than hardcoding it: ROCm installs to a VERSIONED
+# /opt/rocm-X.Y.Z with no unversioned symlink, so anything that assumes
+# /opt/rocm fails deep in a build as "hipcc: not found", and a hardcoded
+# version silently rots the next time ROCm updates
+ROCM=$(dirname "$(dirname "$(readlink -f "$(which hipcc)")")")
+export ROCM_HOME=$ROCM ROCM_PATH=$ROCM CUDA_HOME=$ROCM
+export PYTORCH_ROCM_ARCH="gfx1100;gfx1101" FORCE_CUDA=1
+
+.venv/bin/python -m pip install --no-build-isolation \
+  git+https://github.com/mit-han-lab/torchsparse.git
+```
+
+Use `python -m pip`, not `.venv/bin/pip`: console scripts carry an absolute
+shebang, so they break if the submodule is ever moved while `bin/python`
+keeps working.
+
+Weights are pulled on first use — ~2.9 GB into `~/.cache/huggingface`, plus
+~1.2 GB of DINOv2 into `~/.cache/torch`. Geometry only (`formats=['mesh']`),
+which is also what keeps AMD viable: neither nvdiffrast nor
+diff-gaussian-rasterization is imported on that path.
+
+**The sketch is not the input.** Every other adapter consumes strokes as
+geometry; TRELLIS consumes images, and DINOv2 patch tokens are the only channel
+through which anything about the sketch reaches the model. So a *conditioner*
+turns strokes into images first, and which one to use is the open experimental
+question rather than an implementation detail — hence the `CONDITIONERS`
+registry in `adapters/trellis.py`. One exists so far:
+
+* **`views`** — multi-view renders of the strokes, rasterized by the editor
+  (`src/engine/strokeViews.ts`) and sent with the job as PNG data URLs in
+  `options.views`, either a flat list for the whole sketch or `{part: [...]}`
+  for a part-based run. Client-side because the app already owns a three.js
+  view of the document; a second renderer in python would be a second thing to
+  keep honest about stroke width, framing and pose.
+
+Those renders are not free-form. `preprocess_image` premultiplies alpha onto
+black (so strokes must be **light** — the benchmark thumbnails' `0x333333`
+disappears), crops to an `alpha > 0.8 * 255` bbox (so they must be **opaque**),
+and resamples to 518 px against a 37×37 DINOv2 patch grid (so hairlines are
+close to invisible — strokes are drawn as **tubes**, not lines).
+
+Those numbers are facts about TRELLIS, not about drawing, so they live in the
+conditioner's `view_spec` and travel to the client with the method
+declaration (`SurfacingAdapter.view_spec`, served as `viewSpec` from
+`/api/health`):
+
+```python
+view_spec = {"size": 518, "count": 4, "pitch": 0.35,
+             "strokeColor": "#dcdcdc", "strokeThickness": 0.012,
+             "margin": 1.15}
+```
+
+The client renders whatever the selected strategy asks for and never knows
+which method it is serving — so a new conditioner changes the renders by
+changing one dict, and a method that wants no images declares nothing and gets
+none. `strokeThickness` is a fraction of the sketch's bounding radius rather
+than pixels, so line weight is independent of the units a sketch was drawn in.
+
+### Mesh cleanup, and why it differs by backend
+
+Raw FlexiCubes output is not watertight and arrives in many connected
+components — measured on one run, 265 fragments holding 3.7% of the area, all
+within 2.5% of the body, which read as shimmer along the silhouette.
+`postprocess_mesh` has two stages and only one is portable:
+
+| stage | what it does | AMD |
+| --- | --- | --- |
+| `simplify` | quadric edge collapse (pyvista, CPU) | works |
+| `fill_holes` | rasterize 100 views, drop rarely-visible components, mincut interior shells | **broken** |
+
+`fill_holes` is the stage that clears the fragments, and on AMD the fork's
+simplified coarse rasterizer returns empty visibility, so it marks every face
+invisible and deletes the mesh (`AMD_GPU_GUIDE.md` §3.3, "Disable fill_holes
+(Critical!)"). That is not a configuration problem — nvdiffrast-hip builds and
+`backend='gl'` is already applied in the checkout; the stage itself is wrong
+there. So the `fill_holes` param defaults to `auto`, following
+`backends.json`, and the `min_component` param clears fragments by area
+instead where it cannot run. Area is a cruder rule than visibility: it cannot
+tell a small part from a stray shell, only small from large.
+
+Set `fill_holes` to `off` explicitly when comparing the two backends, or they
+are not cleaned alike and the meshes are not comparable.
+
+One more caveat before reading a bad result as a bad method:
+`run_multi_image` takes **no camera poses** — it
+reconciles views purely from their tokens — so more views is not monotonically
+better, and three or four well-spread ones beat a dozen.
+
+Measured on this box (RX 7800 XT, 8 + 8 steps, 3 views): ~35 s cold, of which
+almost all is the pipeline load; both flow stages together run in about 8 s and
+decode ~124 k vertices. The result lands in a normalized cube, so `fit_to_sketch`
+scales it uniformly into the strokes' bounding box — uniformly, because fitting
+each axis independently would shear the shape the model inferred.

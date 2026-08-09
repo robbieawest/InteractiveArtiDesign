@@ -87,9 +87,14 @@ export SUITESPARSE_PREFIX="$DEPS_PREFIX"
 export CLUSTER_PYTHON="$DEPS_PREFIX/bin/python"
 export LD_LIBRARY_PATH="$DEPS_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-# No ROCm here: drops HSA_OVERRIDE_GFX_VERSION / HIP_VISIBLE_DEVICES, which
-# are meaningless on NVIDIA and misleading beside Slurm's CUDA_VISIBLE_DEVICES.
-export SURFACING_GPU_BACKEND=cuda
+# The cluster is NVIDIA, so cuda: adapters/common.py then applies that entry
+# from surfacing-server/backends.json, whose `env` is empty — no
+# HSA_OVERRIDE_GFX_VERSION, which is meaningless here.
+#
+# A default, not a forced value. setup_venvs.sh sources this file, and since
+# the backend now also picks the torch wheel index, forcing it would install
+# CUDA torch on a workstation where local/env.sh had already said rocm.
+export SURFACING_GPU_BACKEND="${SURFACING_GPU_BACKEND:-cuda}"
 
 # One task owns its scratch directory outright, so there is nothing to prune —
 # and pruning would be actively wrong, since two array tasks can land on the

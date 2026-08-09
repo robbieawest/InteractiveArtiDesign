@@ -13,3 +13,9 @@
 [submodule "surfacing-server/methods/surface-fitting-3d-sketches"]
 	path = surfacing-server/methods/surface-fitting-3d-sketches
 	url = https://github.com/robbieawest/surface-fitting-3d-sketches
+[submodule "surfacing-server/methods/TRELLIS"]
+	path = surfacing-server/methods/TRELLIS
+	url = https://github.com/robbieawest/TRELLIS
+[submodule "surfacing-server/methods/TRELLIS-AMD"]
+	path = surfacing-server/methods/TRELLIS-AMD
+	url = https://github.com/robbieawest/TRELLIS-AMD

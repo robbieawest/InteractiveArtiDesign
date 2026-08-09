@@ -58,10 +58,21 @@ export default defineConfig({
       "/api": "http://127.0.0.1:8801",
     },
     watch: {
-      // never watch the python sidecar: its venvs hold tens of thousands
-      // of files and jobs/ writes checkpoints throughout an optimization —
-      // enough to exhaust inotify watches and crash vite (ENOSPC)
+      // never watch the python sidecar: its venvs hold tens of thousands of
+      // files, its method submodules another few hundred thousand (the
+      // TRELLIS-AMD one alone carries a 16GB env), and jobs/ writes
+      // checkpoints throughout an optimization — enough to exhaust inotify
+      // watches and crash vite (ENOSPC). None of it is read by the browser
+      // build.
       ignored: ["**/surfacing-server/**"],
     },
+  },
+  test: {
+    // the app's own tests only. Method venvs live inside surfacing-server/
+    // and their site-packages contain third-party .test.ts files (gradio's
+    // frontend suite, vendored under TRELLIS-AMD), which vitest would
+    // otherwise collect and fail on. Matched by venv rather than by method
+    // name so the next method to arrive is covered without an edit.
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.venv*/**"],
   },
 });

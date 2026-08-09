@@ -34,6 +34,20 @@ fi
 
 PY_VERSION="${PY_VERSION:-3.10}"
 
+# Download to stdout, with whichever fetcher the machine has. Not curl alone:
+# it is absent on some managed hosts and unavailable without root there, and
+# this is the only thing in the setup that needs the network by hand.
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -Ls "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$1"
+    else
+        echo "need curl or wget to fetch $1" >&2
+        return 1
+    fi
+}
+
 if [[ -x "$DEPS_PREFIX/bin/python" && -f "$DEPS_PREFIX/lib/libcholmod.so" ]]; then
     echo "=== deps prefix already at $DEPS_PREFIX"
     "$DEPS_PREFIX/bin/python" --version
@@ -43,7 +57,7 @@ else
     if ! command -v micromamba >/dev/null; then
         echo "--- fetching micromamba (one static binary, no admin needed)"
         mkdir -p "$REPO/deps/bin"
-        curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        fetch https://micro.mamba.pm/api/micromamba/linux-64/latest \
             | tar -xj -C "$REPO/deps" bin/micromamba
         export PATH="$REPO/deps/bin:$PATH"
     fi
