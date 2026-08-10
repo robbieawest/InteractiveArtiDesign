@@ -87,9 +87,26 @@
         "repo": "methods/TRELLIS",
         "python": "methods/TRELLIS/.venv/bin/python",
         "fill_holes": true,
+        "_attn_backend": [
+          "xformers, not flash-attn, for two reasons.",
+          "",
+          "Spelling: TRELLIS matches ATTN_BACKEND against ['xformers',",
+          "'flash_attn', 'sdpa', 'naive'] — UNDERSCORE. The 'flash-attn' that",
+          "stood here was silently ignored, and only looked correct because",
+          "flash_attn is also the module default. Any value not on that list",
+          "is dropped without a word.",
+          "",
+          "Installability: xformers is a prebuilt wheel from the pytorch",
+          "index, version-matched to torch by TRELLIS's setup.sh; flash-attn",
+          "is an sdist that compiles CUDA kernels, so it needs nvcc — which a",
+          "cluster node or container with drivers but no toolkit does not",
+          "have. sdpa is not an option: only the DENSE attention path accepts",
+          "it, the sparse one falls back to its flash_attn default and dies",
+          "at import."
+        ],
         "env": {
           "SPCONV_ALGO": "native",
-          "ATTN_BACKEND": "flash-attn",
+          "ATTN_BACKEND": "xformers",
           "SPARSE_BACKEND": "spconv"
         }
       }

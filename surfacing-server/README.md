@@ -464,14 +464,35 @@ Both are submodules like every other method, so a machine only initializes the
 one its backend needs:
 
 ```bash
-git submodule update --init surfacing-server/methods/TRELLIS-AMD   # or .../TRELLIS
+git submodule update --init --recursive surfacing-server/methods/TRELLIS
+git submodule update --init surfacing-server/methods/TRELLIS-AMD
 ```
+
+`--recursive` matters for upstream and only for upstream: it carries FlexiCubes
+as a **nested submodule** (`trellis/representations/mesh/flexicubes`, from
+MaxtirError/FlexiCubes), while the AMD fork vendors those files directly. Miss
+it and the checkout looks complete — the directory exists, just empty — until
+the mesh decoder fails with `No module named
+trellis.representations.mesh.flexicubes.flexicubes`. That one is not a pip
+gap and no amount of installing fixes it; FlexiCubes is pure python (two
+files, nothing to build) and reaches the venv only through git. A machine that
+cannot reach github has to be sent the files, which for the cluster means
+initializing the nested submodule locally before `cluster/pack.sh` runs.
 
 Override either with `TRELLIS_REPO` / `TRELLIS_PYTHON`. The venv lives *inside*
 the checkout (`<repo>/.venv`), not beside the server's, because the two forks
 need incompatible torch builds — and because that keeps a 16 GB environment
-inside the submodule that owns it. The parameters, the worker protocol and the
-output are identical across the two, so results are comparable.
+inside the submodule that owns it. The parameters and the worker protocol are
+identical across the two.
+
+The *output* is not, quite. Measured against each other, upstream on CUDA comes
+out visibly cleaner than the fork on ROCm even with `fill_holes` off on both,
+so the difference is not the postprocessing stage the backend table already
+accounts for. The candidates are the pieces the two stacks genuinely do not
+share — xformers vs sdpa attention, spconv vs torchsparse convolutions, and
+two different torch builds — all of which perturb the same weights numerically.
+Treat a cross-backend comparison as indicative rather than controlled, and keep
+a benchmark row to one backend if the number is meant to mean something.
 
 There is nothing to `pip install -r` here — follow each repo's own setup, which
 for both forks is `setup.sh`, a flag-driven installer that pip-installs into
@@ -493,11 +514,74 @@ pip install torch==2.4.0 torchvision==0.19.0 \
   --index-url https://download.pytorch.org/whl/cu121
 
 . ./setup.sh --basic --spconv --xformers
+
+# two gaps in what --basic installs, both found the hard way (see below)
+pip install "transformers==4.46.3" plyfile
 ```
 
 Source it (`. ./setup.sh`) rather than running it: the help path ends in
 `return`, so it is written to be sourced. Seed the venv with pip — the script
 calls plain `pip`, which a `uv venv` without `--seed` does not provide.
+
+`--basic` installs `transformers` **unpinned**, and a current release imports
+`torch.distributed.tensor.DTensor`, which does not exist before torch 2.5 —
+so the pipeline import dies with `ImportError: cannot import name 'DTensor'`
+on the torch this method wants. Pinning transformers back is the cheap
+direction: TRELLIS uses it only for `CLIPTextModel` / `AutoTokenizer` (DINOv2
+comes from `torch.hub`), while moving torch forward would break the xformers
+version match. `plyfile` is simply missing from the script — it is imported
+unconditionally by `representations/gaussian/gaussian_model.py`.
+
+Both failures are import-time and unavoidable, even though neither the text
+pipeline nor gaussians are on the mesh path: `trellis/pipelines/__init__.py`
+imports every pipeline and `trellis/representations/__init__.py` every
+representation, so the whole dependency surface must be satisfied to import
+any of it. `utils3d` (which `--basic` installs from a pinned git revision) is
+the same story. Expect other upstream packaging gaps to look exactly like
+this — a `ModuleNotFoundError` from a module this adapter never calls.
+
+**kaolin is the one to refuse.** Upstream FlexiCubes opens with
+`from kaolin.utils.testing import check_tensor` and uses it for six shape
+asserts in its input validation, nothing else; no other file under `trellis/`
+imports the library. Kaolin is a large source build pinned to an exact torch
+version and needs a CUDA toolkit, which is an absurd price for six asserts and
+unpayable on a node without `nvcc`. So `trellis_worker.stub_kaolin_if_absent`
+puts a module with that single function into `sys.modules` before `trellis` is
+imported, and steps aside if a real kaolin is present. The AMD fork reached
+the same conclusion and edited the helper into its vendored copy; the stub is
+that fix relocated, because upstream's FlexiCubes is a nested submodule where
+an edit would not survive a re-clone.
+
+### A Hugging Face 401 is not a Hugging Face problem
+
+`trellis/pipelines/base.py` loads each submodel through a bare `except`:
+
+```python
+try:    _models[k] = models.from_pretrained(f"{path}/{v}")   # local checkout
+except: _models[k] = models.from_pretrained(v)               # retried as a repo id
+```
+
+So **any** exception in the first call — a missing xformers, a broken kaolin,
+any import error in the model module — is swallowed, and the fallback hands a
+local subpath like `ckpts/ss_flow_img_dit_L_16l8_fp16` to `hf_hub_download` as
+if it were a Hub repository. The Hub answers 401 rather than 404 for repos
+that do not exist, so the traceback ends in `RepositoryNotFoundError`,
+`Invalid username or password` and a link to the authentication docs.
+
+Nothing in this pipeline needs Hub credentials. Read that error as *"an import
+failed upstream of the model load"* and look above the `During handling of the
+above exception` line, where the real traceback is.
+
+Check the import chain before spending a job (and a 4 GB download) on it:
+
+```bash
+ATTN_BACKEND=xformers .venv/bin/python -c "
+import trellis.modules.attention, trellis.modules.sparse
+from trellis.pipelines import TrellisImageTo3DPipeline; print('ok')"
+```
+
+The `[ATTENTION]` and `[SPARSE]` lines it prints are the only confirmation
+that `ATTN_BACKEND` reached both attention paths.
 
 ### Which setup.sh flags this adapter needs
 
@@ -510,7 +594,7 @@ and nothing else:
 | `--spconv` | yes (cuda) | `SPARSE_BACKEND`; prebuilt wheel |
 | `--xformers` or `--flash-attn` | yes, one of | `ATTN_BACKEND`; see below |
 | `--nvdiffrast` | only for `fill_holes` | `postprocessing_utils.py` imports it |
-| `--kaolin` | no | not imported anywhere under `trellis/` |
+| `--kaolin` | no | one assert helper, stubbed by the worker — see below |
 | `--vox2seq` | no | serialized attention only, a mode we do not use |
 | `--diffoctreerast` | no | `octree_renderer.py`; warns and disables itself |
 | `--mipgaussian` | no | gaussian rendering — not on the mesh path |
@@ -542,6 +626,24 @@ from the pytorch index, version-matched to torch by `setup.sh`; `flash-attn` is
 a source distribution that compiles CUDA kernels. Let the script pick the
 xformers version — installing it by hand can silently upgrade torch out from
 under spconv.
+
+`--xformers` **fails silently**. Its installer is a lookup table over exact
+`(CUDA_VERSION, PYTORCH_VERSION)` pairs — CUDA 11.8/12.1/12.4, torch up to
+2.5.0 — and an unlisted pair prints `[XFORMERS] Unsupported PyTorch & CUDA
+version` and installs nothing, exit code 0. So confirm it landed rather than
+trusting the script:
+
+```bash
+.venv/bin/python -c "import xformers.ops; print(xformers.__version__)"
+```
+
+If it is missing, take the matching row from `setup.sh`'s own table rather
+than letting pip resolve it:
+
+```bash
+.venv/bin/python -m pip install xformers==0.0.27.post2 \
+  --index-url https://download.pytorch.org/whl/cu121    # torch 2.4.0 / cu121
+```
 
 ### Machines without a CUDA toolkit
 

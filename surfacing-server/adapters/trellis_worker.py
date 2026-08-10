@@ -149,11 +149,68 @@ def postprocess(vertices, faces, config):
     return vertices, faces
 
 
+def stub_kaolin_if_absent() -> None:
+    """Upstream FlexiCubes imports one shape-assertion helper from kaolin —
+    `kaolin.utils.testing.check_tensor`, called only inside its input
+    validation — and nothing else in the mesh path touches the library. Kaolin
+    is a large source build tied to an exact torch version, so paying for it to
+    satisfy six asserts is a bad trade, and on a machine without a CUDA toolkit
+    it is not payable at all.
+
+    So a module object carrying that one function goes into sys.modules before
+    `trellis` is imported. Done here rather than by editing the checkout
+    because FlexiCubes is a *nested* submodule of upstream TRELLIS: a patch
+    there would not survive a re-clone and would have to be reapplied on every
+    machine. The AMD fork vendors FlexiCubes and has already replaced the
+    import with a local copy of the same helper — this is that fix, made to
+    survive.
+
+    A real *working* kaolin, if one is present, always wins — which is why the
+    check imports it rather than asking whether it is installed. A kaolin whose
+    compiled extension never built is installed, importable by `find_spec`, and
+    raises on use: treating that as "present" hands FlexiCubes a broken library
+    and steps aside from the fix.
+    """
+    import types
+
+    try:
+        import kaolin.utils.testing  # noqa: F401
+        return
+    except Exception as exc:
+        if not isinstance(exc, ModuleNotFoundError):
+            log(f"kaolin is installed but does not import ({exc}); stubbing it")
+
+    def check_tensor(tensor, shape, throw=True):
+        import torch
+
+        ok = torch.is_tensor(tensor) and len(tensor.shape) == len(shape) and all(
+            expected is None or actual == expected
+            for actual, expected in zip(tensor.shape, shape)
+        )
+        if not ok and throw:
+            raise ValueError(f"expected shape {shape}, got {getattr(tensor, 'shape', type(tensor))}")
+        return ok
+
+    kaolin = types.ModuleType("kaolin")
+    utils = types.ModuleType("kaolin.utils")
+    testing = types.ModuleType("kaolin.utils.testing")
+    testing.check_tensor = check_tensor
+    utils.testing = testing
+    kaolin.utils = utils
+    sys.modules.update({
+        "kaolin": kaolin,
+        "kaolin.utils": utils,
+        "kaolin.utils.testing": testing,
+    })
+    log("using the built-in check_tensor stub in place of kaolin")
+
+
 def main() -> None:
     config = json.loads(Path(sys.argv[1]).read_text())
 
     progress("load", 0.0, "loading TRELLIS")
     configure_torchsparse_for_hip()
+    stub_kaolin_if_absent()
 
     import numpy as np
     import torch

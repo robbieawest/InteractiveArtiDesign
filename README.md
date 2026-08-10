@@ -167,9 +167,12 @@ TRELLIS is the exception to all of the above, in three ways:
   you get is decided by `SURFACING_GPU_BACKEND`, so initialize the matching
   submodule and only that one:
   ```bash
-  git submodule update --init surfacing-server/methods/TRELLIS       # cuda
-  git submodule update --init surfacing-server/methods/TRELLIS-AMD   # rocm
+  git submodule update --init --recursive surfacing-server/methods/TRELLIS  # cuda
+  git submodule update --init surfacing-server/methods/TRELLIS-AMD          # rocm
   ```
+  `--recursive` is required for upstream, which carries FlexiCubes as a nested
+  submodule; the AMD fork vendors it. Without it the mesh decoder fails at
+  import with a missing `trellis.representations.mesh.flexicubes` module.
 - **The venv lives inside the checkout** (`methods/TRELLIS/.venv`), not beside
   the server, because the two forks need incompatible torch builds. There is no
   `requirements-trellis.txt` — follow each repo's own setup instructions.
