@@ -78,30 +78,114 @@ python3 -m venv .venv
 That gets you the server and its built-in `bbox` adapter, a stand-in that boxes
 each part so the whole pipeline can be exercised end to end.
 
+### Set the GPU backend first
+
+Everything vendor-dependent — which torch wheel index to install from, which
+defines a method subprocess needs, and for TRELLIS which *fork* to run — lives
+in `surfacing-server/backends.json`, keyed by `SURFACING_GPU_BACKEND`.
+
+**It defaults to `rocm`.** On an NVIDIA machine:
+
+```bash
+export SURFACING_GPU_BACKEND=cuda
+```
+
+Set it in two places or you will get confusing failures:
+
+- **before installing** any method venv, so the CUDA wheels are the ones that
+  get fetched. Setting it afterwards does not re-install anything, and nothing
+  complains until the first job runs.
+- **in the environment that starts the server** — the shell you run `npm run
+  dev` from (the sidecar inherits it), or the one you run uvicorn in. Miss this
+  and the adapters resolve the ROCm row: TRELLIS in particular will report that
+  *TRELLIS-AMD* is missing on a machine that has upstream TRELLIS checked out.
+
+`cluster/env.sh` already exports `cuda`, so a shell that sourced it is fine.
+An unknown value is an error in every consumer rather than a silent fallback.
+
 ### Real surfacing methods
 
 Each real method lives in its own repository (a submodule under
-`surfacing-server/methods/`) with its own Python environment, so that the
-server's env stays torch-free and method dependencies never conflict. They are
-**opt-in one at a time** — initialize only the submodules you intend to run:
+`surfacing-server/methods/`) with its own Python environment, so the server's
+env stays torch-free and method dependencies never conflict. They are **opt-in
+one at a time** — set up only the ones you intend to run.
+
+| adapter | submodule | env | needs beyond `pip install` |
+| --- | --- | --- | --- |
+| `bbox` | — | server env | nothing; test stand-in, always available |
+| `ns2s` | `NeuralSketch2Surf` | `.venv-ns2s` | S2V-Net checkpoint |
+| `vns` | `vns` | `.venv-vns` | system SuiteSparse for scikit-sparse |
+| `neuvas` | `NeuVAS` | `.venv-neuvas` | nothing — optimizes per sketch |
+| `vrs2s` | `VRSketch2Shape` | `.venv-vrs2s` | sketch2model checkpoint |
+| `sf3d` | `surface-fitting-3d-sketches` | `.venv-sf3d` | build `external/pygco`; CPU only |
+| `trellis` | `TRELLIS` / `TRELLIS-AMD` | *inside the checkout* | upstream's own setup — see below |
+
+The shape of a method install is the same for all but TRELLIS: init the
+submodule, make a venv beside the server, install torch **first** from the
+index this backend calls for, then the method's requirements file.
 
 ```bash
 git submodule update --init surfacing-server/methods/NeuralSketch2Surf
+cd surfacing-server
+python3 -m venv .venv-ns2s
+.venv-ns2s/bin/pip install torch==2.8.0 \
+  --index-url https://download.pytorch.org/whl/cu128     # rocm6.4 on AMD
+.venv-ns2s/bin/pip install -r requirements-ns2s.txt
 ```
 
-Per-method setup — venv, torch build, checkpoints to download, and the handful
-of methods that need something compiled — is documented method by method in
-[`surfacing-server/README.md`](surfacing-server/README.md), which is also where
-the job protocol and the benchmark harness are described.
+torch is deliberately absent from every requirements file — the index above is
+the only thing deciding whether a venv ends up CUDA or ROCm, which is why the
+backend has to be settled first. The per-backend indices are in
+`backends.json` (`cu128`/`rocm6.4`, and `cu121`/`rocm6.2` for `vns`, which pins
+an older torch).
 
-GPU-vendor-dependent settings (which torch wheel index to install from, which
-defines each method subprocess needs) all live in
-`surfacing-server/backends.json`, keyed by `SURFACING_GPU_BACKEND`. It defaults
-to `rocm`; on an NVIDIA machine export `SURFACING_GPU_BACKEND=cuda` **before**
-installing the method venvs, so the install and the runtime agree.
+`cluster/setup_venvs.sh` does all of this for every method in one pass, reading
+the indices from `backends.json` — worth using even off-cluster. Run
+`cluster/setup_native.sh` first: the `vns` venv compiles scikit-sparse against
+system SuiteSparse and fails without it.
+
+Checkpoints are not in the repos and are not downloaded automatically:
+
+| method | file | from | into |
+| --- | --- | --- | --- |
+| `ns2s` | `best_model_jit.pt` | [HongshengY/S2V_Net](https://huggingface.co/HongshengY/S2V_Net) | `methods/NeuralSketch2Surf/checkpoints/` |
+| `vrs2s` | `df_epoch_best_multicls.pth` | [YiziChen/sketch2model](https://huggingface.co/YiziChen/sketch2model) | `methods/VRSketch2Shape/weights/all_class/` |
+
+`sf3d` needs one compiled dependency (`external/pygco`, an alpha-expansion
+graph cut whose sources are downloaded by its own makefile) and `neuvas` needs
+nothing at all. Both are written out step by step, along with the parameters,
+quirks and runtimes of every method, in
+[`surfacing-server/README.md`](surfacing-server/README.md) — that file is the
+reference; this is the map.
+
+### TRELLIS
+
+TRELLIS is the exception to all of the above, in three ways:
+
+- **Two checkouts, one adapter.** Upstream is CUDA-only (custom kernels,
+  xformers, flash-attn), so AMD runs the TRELLIS-AMD fork instead. Which one
+  you get is decided by `SURFACING_GPU_BACKEND`, so initialize the matching
+  submodule and only that one:
+  ```bash
+  git submodule update --init surfacing-server/methods/TRELLIS       # cuda
+  git submodule update --init surfacing-server/methods/TRELLIS-AMD   # rocm
+  ```
+- **The venv lives inside the checkout** (`methods/TRELLIS/.venv`), not beside
+  the server, because the two forks need incompatible torch builds. There is no
+  `requirements-trellis.txt` — follow each repo's own setup instructions.
+  Override the pair with `TRELLIS_REPO` / `TRELLIS_PYTHON`.
+- **Weights download on first use** — ~2.9 GB into `~/.cache/huggingface` plus
+  ~1.2 GB of DINOv2 into `~/.cache/torch`. On a machine with a small home
+  quota, point `HF_HOME` and `TORCH_HOME` at scratch before the first job.
+
+Comparing results across the two backends? Set the `fill_holes` parameter to
+`off` explicitly. It defaults to `auto`, which follows `backends.json` and is
+on for CUDA and off for ROCm, so the meshes are not cleaned alike otherwise.
 
 `cluster/` holds scripts for running the same methods as batch sweeps on a
-Slurm cluster; see `cluster/README.md`.
+Slurm cluster; see `cluster/README.md`. Note that those scripts name the
+server's own environment `.venv-server`, while `vite.config.ts` looks for a
+bare `.venv` — on a machine that has both roles, symlink one to the other.
 
 ## Deployment
 

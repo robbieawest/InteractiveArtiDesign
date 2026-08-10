@@ -473,8 +473,119 @@ need incompatible torch builds — and because that keeps a 16 GB environment
 inside the submodule that owns it. The parameters, the worker protocol and the
 output are identical across the two, so results are comparable.
 
-There is nothing to `pip install -r` here — follow each repo's own setup. On
-ROCm only `torchsparse` has to build from source, and it needs an explicit
+There is nothing to `pip install -r` here — follow each repo's own setup, which
+for both forks is `setup.sh`, a flag-driven installer that pip-installs into
+**whatever environment is active**. Skip its `--new-env`: that flag makes a
+conda environment named `trellis`, while this adapter resolves the interpreter
+from `backends.json` and expects it inside the checkout. So create the venv
+first and let the script populate it:
+
+```bash
+cd methods/TRELLIS            # or TRELLIS-AMD
+python3.10 -m venv .venv      # `uv venv --python 3.10 --seed .venv` also fine
+source .venv/bin/activate
+
+# torch FIRST: setup.sh imports it to detect the platform and to pick matching
+# wheel versions. The version it selects for you is the one upstream's own
+# --new-env pins; do not reach for the index in backends.json, which governs
+# the `.venv-*` method envs beside the server, not this one.
+pip install torch==2.4.0 torchvision==0.19.0 \
+  --index-url https://download.pytorch.org/whl/cu121
+
+. ./setup.sh --basic --spconv --xformers
+```
+
+Source it (`. ./setup.sh`) rather than running it: the help path ends in
+`return`, so it is written to be sourced. Seed the venv with pip — the script
+calls plain `pip`, which a `uv venv` without `--seed` does not provide.
+
+### Which setup.sh flags this adapter needs
+
+Only four of the twelve matter, because the adapter asks for `formats=['mesh']`
+and nothing else:
+
+| flag | needed | why |
+| --- | --- | --- |
+| `--basic` | yes | utils3d, trimesh, pyvista, transformers, ninja |
+| `--spconv` | yes (cuda) | `SPARSE_BACKEND`; prebuilt wheel |
+| `--xformers` or `--flash-attn` | yes, one of | `ATTN_BACKEND`; see below |
+| `--nvdiffrast` | only for `fill_holes` | `postprocessing_utils.py` imports it |
+| `--kaolin` | no | not imported anywhere under `trellis/` |
+| `--vox2seq` | no | serialized attention only, a mode we do not use |
+| `--diffoctreerast` | no | `octree_renderer.py`; warns and disables itself |
+| `--mipgaussian` | no | gaussian rendering — not on the mesh path |
+| `--demo`, `--train` | no | gradio; and `--train` calls `sudo apt` |
+
+### Attention backend: xformers, not sdpa
+
+There are two attention paths and they accept **different** values. Dense
+(`trellis/modules/attention/__init__.py`) takes `xformers`, `flash_attn`,
+`sdpa` or `naive`. Sparse (`trellis/modules/sparse/__init__.py`) takes only
+`xformers` or `flash_attn`, and silently ignores anything else — leaving its
+`flash_attn` default in place, which then fails at import:
+
+```python
+if ATTN == 'xformers':     import xformers.ops as xops
+elif ATTN == 'flash_attn': import flash_attn
+else: raise ValueError(...)
+```
+
+So `ATTN_BACKEND=sdpa` on upstream is not a slower fallback, it is an
+`ImportError: flash_attn` from a configuration that reads as correct. Upstream
+has no sdpa sparse path at all; the AMD fork added one, which is why the `rocm`
+row can pair `sdpa` with `XFORMERS_DISABLED=1` and the `cuda` row cannot.
+`SPARSE_ATTN_BACKEND` overrides the sparse side alone if the two ever need to
+differ.
+
+Between the two supported choices, **xformers installs as a prebuilt wheel**
+from the pytorch index, version-matched to torch by `setup.sh`; `flash-attn` is
+a source distribution that compiles CUDA kernels. Let the script pick the
+xformers version — installing it by hand can silently upgrade torch out from
+under spconv.
+
+### Machines without a CUDA toolkit
+
+A cluster node or a container often has drivers and a torch build but no
+`nvcc`, and no way to install one. That rules out `--flash-attn`, and it is
+worth knowing exactly where else a toolkit is and is not required:
+
+| component | needs nvcc |
+| --- | --- |
+| torch, spconv, xformers | no — all prebuilt wheels |
+| `pip install nvdiffrast` | no — pure python, ships its sources |
+| `import nvdiffrast.torch` | no — the plugin builds lazily |
+| the first nvdiffrast **rasterize** | **yes** — JIT compile, plus EGL/GL headers |
+| flash-attn | **yes** — sdist, compiles kernels |
+
+Since the only rasterize call on this path is inside `fill_holes`, a
+toolkit-less machine loses that one stage and nothing else. Set `fill_holes` to
+`off` and clear loose fragments with `min_component` instead — the same
+configuration the ROCm row uses, which has the side benefit of making the two
+backends' meshes comparable. Nothing crashes if you get this wrong:
+`trellis_worker.postprocess` never imports `postprocessing_utils` unless a
+stage is actually enabled, and wraps the call so a failure logs a warning and
+keeps the raw mesh.
+
+`nvcc` is installable without root from PyPI (`nvidia-cuda-nvcc-cu12`,
+`nvidia-cuda-runtime-cu12`) if you also assemble a `CUDA_HOME` that looks like
+a real toolkit — the wheels land in separate `site-packages/nvidia/*` trees.
+It buys `fill_holes` and nothing else, so it is rarely worth it.
+
+Check what a checkout thinks it has:
+
+```bash
+.venv/bin/python -c "
+import torch; print(torch.__version__, torch.cuda.is_available())
+from torch.utils.cpp_extension import CUDA_HOME; print('CUDA_HOME:', CUDA_HOME)
+import trellis.modules.attention, trellis.modules.sparse"
+```
+
+The two modules print their chosen backends at import, so this is also how you
+confirm `ATTN_BACKEND` reached both of them.
+
+### ROCm build notes
+
+On ROCm only `torchsparse` has to build from source, and it needs an explicit
 prefix because the installer hardcodes one that may not exist:
 
 ```bash
@@ -495,9 +606,13 @@ shebang, so they break if the submodule is ever moved while `bin/python`
 keeps working.
 
 Weights are pulled on first use — ~2.9 GB into `~/.cache/huggingface`, plus
-~1.2 GB of DINOv2 into `~/.cache/torch`. Geometry only (`formats=['mesh']`),
-which is also what keeps AMD viable: neither nvdiffrast nor
-diff-gaussian-rasterization is imported on that path.
+~1.2 GB of DINOv2 into `~/.cache/torch`. Point `HF_HOME` / `TORCH_HOME` at
+scratch first on a machine with a small home quota.
+
+Geometry only (`formats=['mesh']`), which is also what keeps AMD viable: the
+renderers are never imported on that path, so diff-gaussian-rasterization is
+not needed at all and nvdiffrast only for the `fill_holes` postprocessing
+stage.
 
 **The sketch is not the input.** Every other adapter consumes strokes as
 geometry; TRELLIS consumes images, and DINOv2 patch tokens are the only channel
