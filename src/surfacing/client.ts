@@ -112,8 +112,16 @@ export interface ViewSpec {
   size?: number;
   /** How many angles, evenly spaced in yaw. */
   count?: number;
-  /** Elevation of the orbit, in radians above the horizon. */
+  /** Elevation of the orbit, in radians above the horizon. For `helix` this
+   *  is the elevation of the first view. */
   pitch?: number;
+  /** Where the camera ends up. `ring` holds `pitch` for every view, so they
+   *  differ in yaw alone; `helix` also climbs from `pitch` to `pitchMax`
+   *  across the sequence, so the last view looks down on the sketch. */
+  layout?: "ring" | "helix";
+  /** Elevation of the last view under `helix`, in radians. Ignored by
+   *  `ring`. Capped short of vertical by the renderer. */
+  pitchMax?: number;
   /** CSS colour string, e.g. "#dcdcdc". */
   strokeColor?: string;
   /** Tube radius as a fraction of the sketch's bounding radius; 0 draws
@@ -121,7 +129,18 @@ export interface ViewSpec {
   strokeThickness?: number;
   /** Camera pullback as a multiple of the bounding radius. */
   margin?: number;
+  /** Which of this method's params the user may steer the render with, as
+   *  `{ param name: spec field }`. The declaring method owns the mapping, so
+   *  a knob like "how many views" reaches the renderer without the renderer
+   *  learning any method's param names. Resolved and stripped by
+   *  `viewSpecFor`; never reaches the renderer. */
+  overrides?: Record<string, ViewSpecField>;
 }
+
+/** The `ViewSpec` fields a method may expose as a parameter. Deliberately not
+ *  every field: the render style (colour, thickness, size) is a fact about
+ *  what the model needs and stays the method's to decide. */
+export type ViewSpecField = "count" | "pitch" | "pitchMax" | "layout";
 
 /** A method that conditions on images of the sketch declares how it wants
  *  them rendered; the client obliges and sends the PNGs in `options.views`.
@@ -144,7 +163,12 @@ export interface MethodInfo {
 
 /** The spec a method's current options select, or null if it wants no
  *  renders. Kept here rather than in the caller so every submit path — the
- *  Surfacer panel, the benchmark runner — resolves it the same way. */
+ *  Surfacer panel, the benchmark runner — resolves it the same way.
+ *
+ *  Any `overrides` the spec declares are folded in here, so what comes back is
+ *  a plain render spec and the renderer never sees a param name. An override
+ *  whose param is absent from `options` leaves the spec's own value alone —
+ *  the method's default stays the default. */
 export function viewSpecFor(
   method: MethodInfo,
   options: MethodOptions,
@@ -154,7 +178,20 @@ export function viewSpecFor(
   const key = declared.selector
     ? String(options[declared.selector])
     : DEFAULT_VIEW_SPEC_KEY;
-  return declared.specs[key] ?? null;
+  const spec = declared.specs[key];
+  if (!spec) return null;
+
+  const { overrides, ...resolved } = spec;
+  for (const [param, field] of Object.entries(overrides ?? {})) {
+    const value = options[param];
+    if (value === undefined) continue;
+    if (field === "layout") {
+      if (value === "ring" || value === "helix") resolved.layout = value;
+    } else if (typeof value === "number" && Number.isFinite(value)) {
+      resolved[field] = value;
+    }
+  }
+  return resolved;
 }
 
 const DEFAULT_VIEW_SPEC_KEY = "*";

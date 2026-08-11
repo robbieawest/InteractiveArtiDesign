@@ -145,6 +145,13 @@ class ClientViewsConditioner(Conditioner):
       * `count` is small because run_multi_image takes no camera poses and
         reconciles views from their tokens alone, so extra unposed views add
         ambiguity faster than evidence.
+      * `layout` is how the views are spread. Both count and layout are
+        exposed as parameters (`overrides` below) because they are the
+        experiment here, not a property of the model: whether a fifth view
+        helps, and whether looking down beats going round, are the questions
+        this conditioner exists to ask. The render *style* stays fixed —
+        colour, thickness and size follow from what preprocess_image and
+        DINOv2 do, and are not a matter of taste.
     """
 
     name = "views"
@@ -158,10 +165,48 @@ class ClientViewsConditioner(Conditioner):
         "size": 518,
         "count": 4,
         "pitch": 0.35,
+        "layout": "ring",
+        "pitchMax": 1.2,
         "strokeColor": "#dcdcdc",
         "strokeThickness": 0.012,
         "margin": 1.15,
+        # param name (as the adapter prefixes it) -> ViewSpec field. The
+        # client resolves these against the job's options, so the knobs reach
+        # the renderer without it knowing anything about TRELLIS.
+        "overrides": {
+            "views_count": "count",
+            "views_layout": "layout",
+        },
     }
+    params = [
+        {
+            "name": "count",
+            "label": "views",
+            "type": "int",
+            "default": 4,
+            "min": 1,
+            "max": 12,
+            "step": 1,
+            "help": "How many renders the model conditions on. Nothing in "
+            "TRELLIS caps this, but in 'stochastic' mode the views are dealt "
+            "out one per sampling step, so more views than steps are never "
+            "used at all and fewer steps each is the price of more views. "
+            "'multidiffusion' uses every view every step, at a cost linear in "
+            "this number.",
+        },
+        {
+            "name": "layout",
+            "label": "view layout",
+            "type": "choice",
+            "default": "ring",
+            "choices": ["ring", "helix"],
+            "help": "Where the cameras go. 'ring' orbits at one elevation, so "
+            "the views differ in yaw alone. 'helix' also climbs as it orbits, "
+            "ending looking down at the sketch — the views are less alike, "
+            "which is worth more to a model that gets no camera poses than "
+            "another view from the same height would be.",
+        },
+    ]
 
     def prepare(
         self,

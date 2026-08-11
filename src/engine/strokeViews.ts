@@ -19,14 +19,23 @@ import {
 } from "./sketchRender";
 import type { SurfacingSketch, ViewSpec } from "../surfacing/client";
 
-const DEFAULTS: Required<ViewSpec> = {
+const DEFAULTS: Required<Omit<ViewSpec, "overrides">> = {
   size: 518,
   count: 4,
   pitch: 0.35,
+  layout: "ring",
+  pitchMax: 1.2,
   strokeColor: "#dcdcdc",
   strokeThickness: 0.012,
   margin: 1.15,
 };
+
+/** How close to straight down a view may get, in radians. Past this the view
+ *  direction is parallel to the camera's up vector and the lookAt basis is
+ *  degenerate — three.js resolves it to an arbitrary roll, so a "top" view
+ *  would come out spun by some amount that depends on nothing. Just under 80
+ *  degrees keeps a recognizable horizon in the image. */
+const MAX_PITCH = 1.4;
 
 function styleFor(spec: ViewSpec): SketchRenderStyle {
   const merged = { ...DEFAULTS, ...spec };
@@ -48,18 +57,39 @@ function styleFor(spec: ViewSpec): SketchRenderStyle {
   };
 }
 
-/** `count` directions evenly spaced in yaw at a constant pitch. Deterministic
- *  on purpose — a sketch always produces the same views, so a difference
- *  between two runs is the method's, not the framing's. */
-export function orbitDirections(count: number, pitch: number): THREE.Vector3[] {
+/** `count` directions evenly spaced in yaw. Deterministic on purpose — a
+ *  sketch always produces the same views, so a difference between two runs is
+ *  the method's, not the framing's.
+ *
+ *  `ring` holds one elevation, which makes every view a side view: cheap to
+ *  reason about, and the views differ only in what the yaw reveals. `helix`
+ *  climbs from `pitch` to `pitchMax` as it goes round, so the set ends looking
+ *  down at the sketch. That matters for image-conditioned methods that take no
+ *  camera poses: they reconcile views from image content alone, so two views
+ *  that look alike are ambiguity rather than evidence, and elevation separates
+ *  them far better than more yaws at the same height do. */
+export function orbitDirections(
+  count: number,
+  pitch: number,
+  layout: "ring" | "helix" = "ring",
+  pitchMax: number = pitch,
+): THREE.Vector3[] {
+  const top = Math.min(pitchMax, MAX_PITCH);
+  const base = Math.min(pitch, MAX_PITCH);
   const directions: THREE.Vector3[] = [];
   for (let i = 0; i < count; i++) {
     const yaw = (2 * Math.PI * i) / count;
+    // a one-view helix has nowhere to climb to, and dividing by count - 1
+    // would be a division by zero
+    const elevation =
+      layout === "helix" && count > 1
+        ? base + ((top - base) * i) / (count - 1)
+        : base;
     directions.push(
       new THREE.Vector3(
-        Math.cos(pitch) * Math.sin(yaw),
-        Math.sin(pitch),
-        Math.cos(pitch) * Math.cos(yaw),
+        Math.cos(elevation) * Math.sin(yaw),
+        Math.sin(elevation),
+        Math.cos(elevation) * Math.cos(yaw),
       ),
     );
   }
@@ -71,12 +101,12 @@ export async function renderStrokeViews(
   sketch: SurfacingSketch,
   spec: ViewSpec = {},
 ): Promise<string[]> {
-  const { count, pitch } = { ...DEFAULTS, ...spec };
+  const { count, pitch, layout, pitchMax } = { ...DEFAULTS, ...spec };
   return renderSketchViews(
     sketch,
     [],
     styleFor(spec),
-    orbitDirections(count, pitch),
+    orbitDirections(count, pitch, layout, pitchMax),
   );
 }
 

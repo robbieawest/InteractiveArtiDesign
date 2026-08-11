@@ -3,6 +3,23 @@
 #
 #   cluster/pack.sh                          code only
 #   cluster/pack.sh 2026-08-02T02-09-46      code + that benchmark's inputs
+#   cluster/pack.sh --changed                only what git says you changed
+#   cluster/pack.sh --changed=origin/main    ...since a ref, commits included
+#
+# --changed packs the tracked files that differ from a base ref (HEAD by
+# default, so: your uncommitted edits). It is for the second and later sends,
+# where the far side already has a checkout and a full bundle is a few hundred
+# MB to move three files. Two things it deliberately does not do:
+#
+#   * untracked files are not in it. That is the whole meaning of "tracked",
+#     and it is the trap — a file you have just created is exactly the kind you
+#     want to send. The script lists any it finds and makes you `git add` them
+#     (an intent-to-add, `git add -N`, is enough) or send a full bundle.
+#   * deletions do not propagate. Unpacking only ever writes files, so a file
+#     you deleted here stays on the far side. Delete it there by hand.
+#
+# A named benchmark is still packed whole under --changed: you asked for it by
+# name, and its inputs are not the thing being iterated on.
 #
 # A benchmark is not part of the bundle's job. It is a self-contained folder of
 # JSON that changes on a different schedule from the code, so sending one is an
@@ -47,14 +64,26 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 OUT="${OUT:-icf-bundle.tar.gz}"
 
+BASE=""          # empty = pack everything; otherwise the ref to diff against
+BENCHES=()
+for arg in "$@"; do
+    case "$arg" in
+        --changed)   BASE="HEAD" ;;
+        --changed=*) BASE="${arg#--changed=}" ;;
+        -*) echo "unknown flag: $arg" >&2; exit 1 ;;
+        *)  BENCHES+=("$arg") ;;
+    esac
+done
+
 # local/ rides along: the same sweep over the same cells, scheduled on a
 # machine's own GPUs instead of Slurm, and it imports cells.py and run_one.py
 # out of cluster/. Sending one without the other leaves a half-usable checkout,
 # and it is a few KB. The --exclude='logs/*' below already covers local/logs.
-INCLUDE=(cluster local surfacing-server
-         src index.html vite.config.ts tsconfig.json
-         package.json package-lock.json)
-for bench in "$@"; do
+CODE=(cluster local surfacing-server
+      src index.html vite.config.ts tsconfig.json
+      package.json package-lock.json)
+INCLUDE=("${CODE[@]}")
+for bench in ${BENCHES+"${BENCHES[@]}"}; do
     [[ -d "benchmarks/$bench/sketches" ]] || {
         echo "no benchmarks/$bench/sketches" >&2; exit 1; }
     INCLUDE+=("benchmarks/$bench/sketches")
@@ -62,17 +91,56 @@ for bench in "$@"; do
         INCLUDE+=("benchmarks/$bench/progress.json")
 done
 
-tar czf "$OUT" \
-    --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
-    --exclude='.venv' --exclude='.venv-*' --exclude='jobs' --exclude='bench_vns' \
-    --exclude='node_modules' --exclude='logs/*' --exclude='manifests/*' \
-    "${INCLUDE[@]}"
+EXCLUDES=(--exclude='.git' --exclude='__pycache__' --exclude='*.pyc'
+          --exclude='.venv' --exclude='.venv-*' --exclude='jobs' --exclude='bench_vns'
+          --exclude='node_modules' --exclude='logs/*' --exclude='manifests/*')
+
+if [[ -z "$BASE" ]]; then
+    tar czf "$OUT" "${EXCLUDES[@]}" "${INCLUDE[@]}"
+else
+    git rev-parse --verify --quiet "$BASE" >/dev/null || {
+        echo "not a ref: $BASE" >&2; exit 1; }
+
+    # -d drops deletions: tar cannot pack a file that is gone, and unpacking
+    # could not remove it on the far side anyway.
+    mapfile -t CHANGED < <(
+        git diff --name-only --diff-filter=d "$BASE" -- "${CODE[@]}")
+
+    # The files most likely to be missing from a --changed bundle, called out
+    # by name rather than left to fail as an ImportError on the far side.
+    mapfile -t UNTRACKED < <(
+        git ls-files --others --exclude-standard -- "${CODE[@]}")
+    if ((${#UNTRACKED[@]})); then
+        printf 'untracked, so NOT in this bundle:\n' >&2
+        printf '  %s\n' "${UNTRACKED[@]}" >&2
+        printf 'git add -N them to include them, or pack without --changed.\n\n' >&2
+    fi
+
+    if ((${#CHANGED[@]} == 0)) && ((${#BENCHES[@]} == 0)); then
+        echo "nothing tracked has changed since $BASE" >&2; exit 1
+    fi
+
+    # Benchmark inputs stay whole; only the code list is filtered.
+    BENCH_PATHS=()
+    for path in "${INCLUDE[@]}"; do
+        for code in "${CODE[@]}"; do
+            [[ "$path" == "$code" ]] && continue 2
+        done
+        BENCH_PATHS+=("$path")
+    done
+    tar czf "$OUT" "${EXCLUDES[@]}" \
+        ${CHANGED+"${CHANGED[@]}"} ${BENCH_PATHS+"${BENCH_PATHS[@]}"}
+fi
 
 echo "wrote $OUT ($(du -h "$OUT" | cut -f1))"
-if [[ $# -eq 0 ]]; then
+if [[ -n "$BASE" ]]; then
+    echo "  ${#CHANGED[@]} file(s) changed since $BASE:"
+    printf '    %s\n' ${CHANGED+"${CHANGED[@]}"}
+fi
+if ((${#BENCHES[@]} == 0)); then
     echo "  code only — no benchmark inputs included"
 else
-    echo "  with inputs for: $*"
+    echo "  with inputs for: ${BENCHES[*]}"
 fi
 cat <<EOF
 
@@ -91,7 +159,7 @@ bundle, so the first unpack needs one networked install):
   npm run dev                               # binds 127.0.0.1:5173 there
   ssh -N -L 5173:localhost:5173 \$UUN@icf    # here; then open localhost:5173
 EOF
-if [[ $# -eq 0 ]]; then
+if ((${#BENCHES[@]} == 0)); then
     cat <<'EOF'
 
 to send a benchmark separately (inputs only — results stay here):

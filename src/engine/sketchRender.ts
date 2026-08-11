@@ -217,6 +217,13 @@ function frameCamera(
   camera.near = Math.max(distance / 100, 0.01);
   camera.far = distance + radius * 4;
   camera.updateProjectionMatrix();
+  // A view from directly above or below has its direction parallel to the
+  // default up, which leaves lookAt with no way to choose a roll: the basis
+  // is degenerate and the image comes out spun by an arbitrary angle. Fall
+  // back to -Z there, so a top view is framed with the front of the sketch
+  // upright rather than at random.
+  camera.up.set(0, 1, 0);
+  if (Math.abs(direction.y) > 0.999) camera.up.set(0, 0, -Math.sign(direction.y));
   camera.lookAt(center);
 }
 
