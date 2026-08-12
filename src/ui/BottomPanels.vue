@@ -416,8 +416,13 @@ const emit = defineEmits<{
 
 /** A param with an `enabledWhen` clause is only editable while the referenced
  *  param currently holds the required value (e.g. per-part iterations unlock
- *  once part-based evaluation is ticked on). */
+ *  once part-based evaluation is ticked on).
+ *
+ *  `lockedWhileSurfaced` is the other gate: some params decide what a run has
+ *  to *record*, so they cannot be applied to a surface that already exists.
+ *  Clearing the surface releases them. */
 function paramEnabled(param: MethodParam): boolean {
+  if (param.lockedWhileSurfaced && props.hasSurface) return false;
   const cond = param.enabledWhen;
   if (!cond) return true;
   return props.surfacingOptions[cond.param] === cond.equals;

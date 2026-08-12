@@ -252,6 +252,27 @@
     @open-benchmark="benchmarkOpen = true"
   />
 
+  <FlowTimeline
+    v-if="flowActive || flowHasRaw"
+    :length="flowLength"
+    :structure-steps="flowStructureSteps"
+    :position="flowPosition"
+    :threshold="flowThreshold"
+    :density="flowDensity"
+    :show-raw="flowShowRaw"
+    :has-raw="flowHasRaw"
+    :has-frames="flowActive"
+    :show-sketch-overlay="flowShowSketchOverlay"
+    :can-overlay-sketch="flowCanOverlaySketch"
+    :view-count="flowViewCount"
+    @set-position="flowPosition = $event; applyFlowState()"
+    @set-threshold="flowThreshold = $event; applyFlowState()"
+    @set-density="flowDensity = $event; applyFlowState()"
+    @set-show-raw="setFlowShowRaw($event)"
+    @set-sketch-overlay="flowShowSketchOverlay = $event; applyFlowState()"
+    @close="clearSurface"
+  />
+
   <BenchmarkWindow
     v-if="benchmarkOpen"
     @close="benchmarkOpen = false"
@@ -337,6 +358,9 @@ import {
   type MethodOptions,
 } from "../surfacing/client";
 import { renderConditioningViews } from "../engine/strokeViews";
+import { TrellisInteractiveView } from "../engine/TrellisInteractive";
+import { decodeFlowFrames, type FlowFrames } from "../surfacing/trellisFrames";
+import FlowTimeline from "./trellis-interactive/FlowTimeline.vue";
 import type { JointDofName, SurfaceShape } from "../core/types";
 import { jointPosed } from "../core/types";
 
@@ -417,8 +441,33 @@ const currentOptions = computed(
 );
 const surfacingLog = ref<string[]>([]);
 const SURFACING_LOG_CAP = 1000;
+
+// --- interactive TRELLIS flow view ---
+//
+// A run asked to record its flow takes over the viewport when it finishes:
+// the document's strokes and the ordinary surface overlay go out of sight and
+// a laid-out copy of the run goes up in their place. Nothing here is part of
+// the document — the frames are never serialized and never written to disk,
+// so leaving the view (or any of the paths that already clear a surface)
+// drops them for good and the run would have to be repeated.
+let flowView: TrellisInteractiveView | undefined;
+const flowActive = ref(false);
+const flowLength = ref(0);
+const flowStructureSteps = ref(0);
+const flowPosition = ref(0);
+const flowThreshold = ref(0.5);
+const flowDensity = ref(1);
+const flowShowRaw = ref(false);
+const flowHasRaw = ref(false);
+const flowShowSketchOverlay = ref(false);
+const flowCanOverlaySketch = ref(false);
+const flowViewCount = ref(0);
 /** The shown surface's glb + producing method, kept for embedding in saves. */
 let surfaceGlb: { method: string; bytes: ArrayBuffer } | null = null;
+/** The same result before postprocessing, when the run kept it. Only ever in
+ *  memory: `surfaceGlb` is what rides along in saves, and it is always the
+ *  delivered mesh — the raw one is a diagnostic, not a deliverable. */
+let surfaceRawGlb: ArrayBuffer | null = null;
 
 // parts / poses / panels
 const expandedPanel = ref<PanelName | null>(null);
@@ -518,6 +567,7 @@ onUnmounted(() => {
   surfacePreview?.dispose();
   jointLines?.dispose();
   surface?.dispose();
+  flowView?.dispose();
   strokeRenderer?.dispose();
   viewport?.dispose();
 });
@@ -572,6 +622,9 @@ watch([fillVisible, fillColor], ([visible, color]) => {
 
 function activate(tool: ToolName): void {
   if (!tools) return;
+  // the flow view is modal: the strokes on screen are copies laid out in
+  // regions, so there is nothing here a tool could correctly act on
+  if (flowActive.value && tool !== "none") return;
   attachedHandler?.detach();
   strokeRenderer?.clearHighlights(); // each tool re-applies its own
   activeTool.value = tool;
@@ -673,6 +726,7 @@ function removePart(partId: string): void {
 }
 
 function toggleExplode(): void {
+  if (flowActive.value) return; // modal, same as the tools
   if (explodeMode.value) {
     explodeMode.value = false;
     // drop the drag handler if it was attached, then restore the pose
@@ -797,6 +851,12 @@ async function runSurfacing(): Promise<void> {
       );
     }
 
+    // Artifacts a TRELLIS run was asked to keep. They arrive on the partial
+    // channel during the run and are only assembled into a view once it has
+    // finished — the whole capture is post-hoc by design.
+    let flowFrames: FlowFrames | null = null;
+    let rawGlb: ArrayBuffer | null = null;
+
     const glb = await runSurfacingJob({
       method,
       sketch,
@@ -819,6 +879,24 @@ async function runSurfacing(): Promise<void> {
         hasSurface.value = true;
         surfaceVisible.value = true;
       },
+      onArtifact: (_name, kind, data) => {
+        if (kind === "raw") {
+          rawGlb = data;
+        } else if (kind === "trellis-frames") {
+          try {
+            flowFrames = decodeFlowFrames(data);
+          } catch (error) {
+            // a capture that cannot be read costs the view, not the run:
+            // the mesh is still on its way and still correct
+            surfacingLog.value = [
+              ...surfacingLog.value,
+              `flow capture unusable: ${
+                error instanceof Error ? error.message : error
+              }`,
+            ];
+          }
+        }
+      },
     });
     await surfacePreview.show(glb);
     // record the result first, so a later skinning hiccup can never lose the
@@ -833,6 +911,24 @@ async function runSurfacing(): Promise<void> {
     // skin the fresh surface to the rig so articulating deforms it; never let
     // a skinning failure abort the surfacing flow
     bindSurfaceSkin();
+
+    surfaceRawGlb = rawGlb;
+    flowHasRaw.value = rawGlb !== null;
+    flowShowRaw.value = false;
+
+    // Only a captured run takes the viewport over. Keeping the raw mesh on
+    // its own is a question about one object, not about a process, so it
+    // stays in the ordinary overlay and the toggle just swaps which mesh is
+    // in it — no reason to hide the document for that.
+    if (flowFrames) {
+      await enterFlowView({
+        sketch,
+        views: Array.isArray(options.views) ? (options.views as string[]) : [],
+        frames: flowFrames,
+        processedGlb: glb,
+        rawGlb,
+      });
+    }
   } catch (error) {
     alert(`Surfacing failed: ${error instanceof Error ? error.message : error}`);
   } finally {
@@ -841,9 +937,89 @@ async function runSurfacing(): Promise<void> {
 }
 
 function clearSurface(): void {
+  exitFlowView();
   surfacePreview?.clear();
   surfaceGlb = null;
+  surfaceRawGlb = null;
+  flowHasRaw.value = false;
+  flowShowRaw.value = false;
   hasSurface.value = false;
+}
+
+/** Hand the viewport over to the flow view for a captured run.
+ *
+ *  The document's own strokes and the surface overlay are hidden rather than
+ *  laid out alongside: the regions hold *copies*, and two sets of the same
+ *  strokes in one scene — one of them the real, pickable, editable one — is
+ *  exactly the confusion this mode exists to avoid. Tools are off for the
+ *  same reason. */
+async function enterFlowView(run: {
+  sketch: ReturnType<typeof buildSurfacingSketch>;
+  views: string[];
+  frames: FlowFrames | null;
+  processedGlb: ArrayBuffer | null;
+  rawGlb: ArrayBuffer | null;
+}): Promise<void> {
+  if (!viewport) return;
+  activate("none");
+  flowView ??= new TrellisInteractiveView(viewport);
+  await flowView.show(run);
+
+  strokeRenderer?.setVisible(false);
+  surfacePreview?.setVisible(false);
+  surface?.setVisible(false);
+
+  flowActive.value = true;
+  flowLength.value = flowView.timelineLength;
+  flowStructureSteps.value = flowView.structureSteps;
+  flowHasRaw.value = run.rawGlb !== null;
+  flowViewCount.value = run.views.length;
+  flowShowRaw.value = false;
+  flowShowSketchOverlay.value = false;
+  flowCanOverlaySketch.value = run.frames?.align != null;
+  // the end of the timeline is the delivered result, so that is where a run
+  // lands — scrubbing back is how you get to the flow
+  flowPosition.value = Math.max(0, flowLength.value - 1);
+  applyFlowState();
+}
+
+/** Give the viewport back. The capture is dropped, not parked. */
+function exitFlowView(): void {
+  if (!flowActive.value && !flowView?.isActive) return;
+  flowView?.clear();
+  flowActive.value = false;
+  flowLength.value = 0;
+  flowHasRaw.value = false;
+  strokeRenderer?.setVisible(sketchVisible.value);
+  surfacePreview?.setVisible(surfaceVisible.value);
+  viewport?.invalidate();
+}
+
+function applyFlowState(): void {
+  flowView?.setState({
+    position: flowPosition.value,
+    showRaw: flowShowRaw.value,
+    showSketchOverlay: flowShowSketchOverlay.value,
+    volume: { threshold: flowThreshold.value, density: flowDensity.value },
+  });
+}
+
+/** The raw/processed switch, in whichever place the result is showing. */
+async function setFlowShowRaw(showRaw: boolean): Promise<void> {
+  flowShowRaw.value = showRaw;
+  if (flowActive.value) {
+    applyFlowState();
+    return;
+  }
+  const chosen = showRaw ? surfaceRawGlb : surfaceGlb?.bytes;
+  if (!surfacePreview || !chosen) return;
+  await surfacePreview.show(chosen);
+  surfacePreview.setStyle({
+    color: surfaceColor.value,
+    opacity: surfaceOpacity.value,
+  });
+  // the overlay was rebuilt, so the skin binding went with it
+  bindSurfaceSkin();
 }
 
 /** Skin the current overlay to the rig. Non-fatal: a skinning failure logs

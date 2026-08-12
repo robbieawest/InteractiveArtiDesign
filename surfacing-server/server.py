@@ -31,12 +31,25 @@ from adapters.common import (
 # megabytes, so only a short tail is kept.
 MAX_FINISHED_JOBS = 4
 
+# Options that make a run record extra state for the interactive viewer.
+# Stripped from any job that writes its result into a benchmark.
+INTERACTIVE_OPTIONS = frozenset({"interactive", "keep_raw"})
+
 
 @dataclass
 class Partial:
-    """A finished piece of a still-running job (typically one part)."""
+    """A blob published mid-run, fetched by index from /partials.
+
+    `kind` tells the client what the bytes are. "glb" is geometry to show in
+    the viewport (a finished part, historically the only case); anything else
+    is an adapter-specific artifact the client routes elsewhere — TRELLIS
+    publishes its unprocessed mesh and its flow-capture bundle this way.
+    Keeping them on this channel means they inherit the cursor, the polling,
+    and the release-on-delivery the geometry already had.
+    """
     name: str
     glb: bytes
+    kind: str = "glb"
 
 
 @dataclass
@@ -94,9 +107,20 @@ def _run_job(job: Job, sketch: dict[str, Any], options: dict[str, Any]) -> None:
         if message:
             job.message = message
 
-    def emit(name: str, glb: bytes) -> None:
-        job.partials.append(Partial(name=name, glb=glb))
+    def emit(name: str, glb: bytes, kind: str = "glb") -> None:
+        job.partials.append(Partial(name=name, glb=glb, kind=kind))
         job.partial_count += 1
+
+    # A benchmark run must never pay for the interactive capture: it is
+    # per-step volumes and a second copy of the mesh, held in RAM by the
+    # worker, this process, and the tab, times every sketch in the sweep.
+    # Enforced here rather than trusted to the client, because the client
+    # that drives benchmarks is not the one that sets these.
+    if job.save is not None:
+        options = {
+            key: value for key, value in options.items()
+            if key not in INTERACTIVE_OPTIONS
+        }
 
     job.status = "running"
     set_current_job(job.id)
@@ -228,8 +252,12 @@ def job_partials(job_id: str, after: int = 0) -> dict[str, Any]:
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "no such job")
-    names = [p.name for p in job.partials[after:]]
-    return {"names": names, "next": after + len(names)}
+    published = job.partials[after:]
+    return {
+        "names": [p.name for p in published],
+        "kinds": [p.kind for p in published],
+        "next": after + len(published),
+    }
 
 
 @app.get("/api/jobs/{job_id}/partials/{index}")
@@ -239,7 +267,14 @@ def job_partial(job_id: str, index: int) -> Response:
         raise HTTPException(404, "no such job")
     if not 0 <= index < len(job.partials):
         raise HTTPException(404, "no such partial")
-    return Response(job.partials[index].glb, media_type="model/gltf-binary")
+    partial = job.partials[index]
+    return Response(
+        partial.glb,
+        media_type=(
+            "model/gltf-binary" if partial.kind in ("glb", "raw")
+            else "application/octet-stream"
+        ),
+    )
 
 
 @app.get("/api/jobs/{job_id}/result")

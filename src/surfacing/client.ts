@@ -54,6 +54,14 @@ export interface SurfaceJobOptions {
   /** A part that has finished while the rest of the job continues. Awaited,
    *  so a handler that parses the glb sees the pieces strictly in order. */
   onPartial?: (name: string, glb: ArrayBuffer) => void | Promise<void>;
+  /** A published blob that is not viewport geometry — an adapter-specific
+   *  artifact, routed by `kind` (TRELLIS sends "raw" and "trellis-frames").
+   *  Same cursor and ordering guarantees as `onPartial`. */
+  onArtifact?: (
+    name: string,
+    kind: string,
+    data: ArrayBuffer,
+  ) => void | Promise<void>;
   /** Abort polling. The server-side job keeps running — this only detaches
    *  the client, which is what closing a window should do. */
   signal?: AbortSignal;
@@ -101,6 +109,10 @@ export interface MethodParam {
    *  value (e.g. a per-part control that unlocks when part-based is on). It
    *  still travels in `options`; the adapter decides whether to use it. */
   enabledWhen?: { param: string; equals: number | boolean | string };
+  /** This param changes what the run has to *record*, so it cannot be
+   *  applied to a surface that already exists — the panel locks it while one
+   *  is on screen, and Clear releases it. */
+  lockedWhileSurfaced?: boolean;
 }
 
 /** How one method wants the sketch rendered for conditioning. Every field is
@@ -246,17 +258,22 @@ export async function runSurfacingJob(
   // (the Surfacer panel) never pays for the bytes
   let partialCursor = 0;
   const pullPartials = async (status: JobStatus) => {
-    if (!opts.onPartial) return;
+    if (!opts.onPartial && !opts.onArtifact) return;
     if ((status.partialCount ?? 0) <= partialCursor) return;
-    const { names } = (await (
+    const { names, kinds } = (await (
       await request(`/api/jobs/${jobId}/partials?after=${partialCursor}`)
-    ).json()) as { names: string[]; next: number };
-    for (const name of names) {
+    ).json()) as { names: string[]; kinds?: string[]; next: number };
+    for (const [offset, name] of names.entries()) {
       const index = partialCursor++;
-      const glb = await (
+      // servers before artifacts existed publish geometry only
+      const kind = kinds?.[offset] ?? "glb";
+      const wanted = kind === "glb" ? opts.onPartial : opts.onArtifact;
+      if (!wanted) continue; // still consumed: the cursor has moved past it
+      const data = await (
         await request(`/api/jobs/${jobId}/partials/${index}`)
       ).arrayBuffer();
-      await opts.onPartial(name, glb);
+      if (kind === "glb") await opts.onPartial?.(name, data);
+      else await opts.onArtifact?.(name, kind, data);
     }
   };
 

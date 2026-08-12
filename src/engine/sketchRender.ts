@@ -154,8 +154,15 @@ function tubeStrokes(
 }
 
 /** Strokes as drawable geometry: hairlines when the style asks for no
- *  thickness, swept tubes otherwise. */
-function buildStrokes(
+ *  thickness, swept tubes otherwise.
+ *
+ *  Exported for the interactive TRELLIS viewer, which needs standalone
+ *  copies of the sketch to place in its regions — the document's own
+ *  StrokeRenderer output is the sketch, in one place, and cannot be
+ *  duplicated into a layout without becoming the source of truth for where
+ *  the strokes are. Caller owns the result and should free it with
+ *  `disposeSketchContent`. */
+export function buildStrokes(
   sketch: SurfacingSketch,
   style: SketchRenderStyle,
 ): THREE.Object3D {
@@ -225,6 +232,11 @@ function frameCamera(
   camera.up.set(0, 1, 0);
   if (Math.abs(direction.y) > 0.999) camera.up.set(0, 0, -Math.sign(direction.y));
   camera.lookAt(center);
+}
+
+/** Free geometry built by `buildStrokes`. Exported alongside it. */
+export function disposeSketchContent(content: THREE.Object3D): void {
+  disposeContent(content);
 }
 
 function disposeContent(content: THREE.Object3D): void {

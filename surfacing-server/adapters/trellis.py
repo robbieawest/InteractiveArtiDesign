@@ -69,6 +69,27 @@ class Unit:
     key: str = "sketch"
 
 
+@dataclass
+class UnitResult:
+    """What one generation produced: always a mesh in sketch coordinates,
+    plus whatever the interactive options asked to be kept."""
+
+    mesh: Any
+    raw: Optional[Any] = None
+    frames: Optional[Path] = None
+    manifest: Optional[dict[str, Any]] = None
+    # the similarity that put the mesh where it is, so the occupancy lattice
+    # (which is the unit cube the mesh was generated in) can follow it
+    align: Optional[dict[str, Any]] = None
+
+
+def _align_rotation(align: dict[str, Any]) -> Any:
+    """The 3x3 rotation out of a flattened align record."""
+    import numpy as np  # server env
+
+    return np.asarray(align["rotation"], dtype=float).reshape(3, 3)
+
+
 class Conditioner(ABC):
     """Turns a unit's strokes into the conditioning images TRELLIS consumes.
 
@@ -351,9 +372,17 @@ STAGE_SPANS: dict[str, tuple[float, float]] = {
     "load": (0.00, 0.35),
     "condition": (0.35, 0.40),
     "sparse_structure": (0.40, 0.62),
-    "slat": (0.62, 0.88),
+    "slat": (0.62, 0.84),
+    "capture": (0.84, 0.88),
     "decode": (0.88, 1.00),
 }
+
+# Wire container for a captured run: a fixed magic, a JSON header describing
+# the frames, then the frames back to back. Binary because the payload is
+# whole u8 volumes — base64 in the job's JSON would be a third again as many
+# bytes through the same pipe that carries the log.
+BUNDLE_MAGIC = b"TRLZ"
+BUNDLE_VERSION = 1
 
 
 class TrellisAdapter(SurfacingAdapter):
@@ -559,6 +588,35 @@ class TrellisAdapter(SurfacingAdapter):
             "the drawing. Uniform scaling only — fitting each axis "
             "independently would shear the shape the model inferred.",
         },
+        {
+            "name": "interactive",
+            "label": "Adapter: interactive flow view",
+            "type": "bool",
+            "default": False,
+            "lockedWhileSurfaced": True,
+            "help": "Record what the two flow stages did, step by step, and "
+            "show it in the viewport instead of just the finished mesh: the "
+            "conditioning views, the sketch, the occupancy grid the structure "
+            "stage samples, and where the latent stage is still moving. Costs "
+            "a decoder pass per structure step and a few MB per run, so it is "
+            "off by default and cannot be changed while a surface is on "
+            "screen — the run has to record it. Ignored for part-based runs, "
+            "which are several independent generations with no single "
+            "timeline.",
+        },
+        {
+            "name": "keep_raw",
+            "label": "Adapter: keep unprocessed mesh",
+            "type": "bool",
+            "default": False,
+            "lockedWhileSurfaced": True,
+            "help": "Also return the mesh as FlexiCubes produced it, before "
+            "simplification, hole filling and fragment removal, so the viewer "
+            "can switch between the two. Worth it when the question is "
+            "whether cleanup deleted something real — it is the stage that "
+            "removes geometry. Roughly ten times the size of the delivered "
+            "mesh.",
+        },
     ] + conditioner_params()
 
     @property
@@ -646,6 +704,15 @@ class TrellisAdapter(SurfacingAdapter):
         # a knob, and the panel never renders them
         views = options.pop("views", None)
 
+        # One timeline or none: a part-based run is several independent
+        # generations, each with its own occupancy grid and its own fit, and
+        # there is nothing for a single scrubber to mean across them.
+        interactive = bool(options.pop("interactive", False))
+        if interactive and part_based:
+            log("interactive flow view off: not meaningful for a part-based "
+                "run (each part is a separate generation)")
+            interactive = False
+
         config = {
             "model": options.pop("model", DEFAULT_MODEL),
             "seed": int(options.pop("seed", 1)),
@@ -655,6 +722,8 @@ class TrellisAdapter(SurfacingAdapter):
             "slat_steps": int(options.pop("slat_steps", 12)),
             "slat_cfg": float(options.pop("slat_cfg", 3.0)),
             "preprocess": bool(options.pop("preprocess", True)),
+            "interactive": interactive,
+            "keep_raw": bool(options.pop("keep_raw", False)),
             "simplify_ratio": float(options.pop("simplify_ratio", 0.9)),
             "fill_holes": self._fill_holes(
                 str(options.pop("fill_holes", "auto")), log
@@ -689,7 +758,7 @@ class TrellisAdapter(SurfacingAdapter):
                     unit_dir,
                     log,
                 )
-                mesh = self._run_one(
+                result = self._run_one(
                     unit, images, config, fit, min_component, unit_dir, repo,
                     python, defines, log,
                     lambda frac, msg, base=base: report(base + span * frac, msg),
@@ -698,8 +767,13 @@ class TrellisAdapter(SurfacingAdapter):
                 log(f"skipping '{unit.label}': {exc}")
                 continue
             emit(unit.label if part_based else "surface",
-                 mesh.export(file_type="glb"))
-            meshes.append(mesh)
+                 result.mesh.export(file_type="glb"))
+            if result.raw is not None:
+                emit("surface (unprocessed)",
+                     result.raw.export(file_type="glb"), "raw")
+            if result.frames is not None:
+                emit("flow", self._bundle(result, log), "trellis-frames")
+            meshes.append(result.mesh)
 
         if not meshes:
             raise RuntimeError("trellis produced no surfaces")
@@ -743,8 +817,9 @@ class TrellisAdapter(SurfacingAdapter):
         defines: dict[str, str],
         log: LogFn,
         on_progress: Callable[[float, str], None],
-    ) -> Any:
-        """Generate one unit and return its mesh in sketch world coordinates."""
+    ) -> "UnitResult":
+        """Generate one unit and return its mesh in sketch world coordinates,
+        together with whatever extras this run was asked to record."""
         import trimesh  # server env
 
         config_path = unit_dir / "config.json"
@@ -754,19 +829,71 @@ class TrellisAdapter(SurfacingAdapter):
             "out": str(unit_dir / "mesh.glb"),
         }, indent=2))
 
-        result = self._run_worker(
+        written, manifest = self._run_worker(
             config_path, unit_dir, unit.label, repo, python, defines, log,
             on_progress,
         )
-        loaded = trimesh.load(result, force="mesh")
+        loaded = trimesh.load(written["final"], force="mesh")
         log(f"'{unit.label}': {len(loaded.vertices)} verts, "
             f"{len(loaded.faces)} faces")
         # before the fit, not after: stray fragments are noise in the
         # stroke-to-surface score the registration minimizes
         loaded = self._drop_small_components(loaded, min_component, unit, log)
-        if fit:
-            self._fit(loaded, unit, log)
-        return loaded
+        align = self._fit(loaded, unit, log) if fit else None
+
+        # The raw mesh is a second view of the same object, not a second
+        # object: it takes the transform solved on the processed one rather
+        # than its own, or the two would not sit on top of each other — and
+        # the fragments it still has are exactly what would drag its own fit.
+        raw = None
+        if "raw" in written:
+            raw = trimesh.load(written["raw"], force="mesh")
+            if align is not None:
+                raw.vertices = (
+                    raw.vertices @ _align_rotation(align).T
+                ) * align["scale"] + align["translation"]
+
+        return UnitResult(
+            mesh=loaded,
+            raw=raw,
+            frames=written.get("frames"),
+            manifest=manifest,
+            align=align,
+        )
+
+    def _bundle(self, result: "UnitResult", log: LogFn) -> bytes:
+        """Pack a captured run for the client: magic, JSON header, frames.
+
+        The header carries the alignment because the client cannot derive it.
+        `run_multi_image` takes no camera poses, so TRELLIS builds in whatever
+        frame it picks and nothing maps the sketch into it — the similarity
+        `_fit` recovered after the fact is the only thing that says where the
+        unit cube (and so the lattice) sits against the drawing. Without a
+        fit there is no answer, and the client leaves the lattice at the
+        origin rather than inventing one.
+        """
+        assert result.frames is not None
+        payload = result.frames.read_bytes()
+        manifest = dict(result.manifest or {})
+        grid = int(manifest.get("grid", 64))
+        header = json.dumps({
+            **manifest,
+            "frameBytes": grid ** 3,
+            "align": result.align,
+        }).encode()
+
+        stages = ", ".join(
+            f"{s['name']} x{s['steps']}" for s in manifest.get("stages", [])
+        )
+        log(f"flow capture: {stages} at {grid}^3 "
+            f"({len(payload) / 1e6:.1f} MB)")
+        return b"".join([
+            BUNDLE_MAGIC,
+            BUNDLE_VERSION.to_bytes(4, "little"),
+            len(header).to_bytes(4, "little"),
+            header,
+            payload,
+        ])
 
     def _fill_holes(self, choice: str, log: LogFn) -> bool:
         """Resolve the `auto` setting against this backend's capability.
@@ -814,8 +941,16 @@ class TrellisAdapter(SurfacingAdapter):
             f"{len(mesh.faces)} faces")
         return merged
 
-    def _fit(self, mesh: Any, unit: Unit, log: LogFn) -> None:
+    def _fit(
+        self, mesh: Any, unit: Unit, log: LogFn
+    ) -> Optional[dict[str, Any]]:
         """Register the generated mesh onto the unit's strokes, in place.
+
+        Returns the similarity it applied (world = scale * rotation @ v +
+        translation), or None if it could not solve one. The interactive
+        viewer needs that transform for the occupancy lattice: the lattice is
+        the unit cube the mesh was generated in, and this is the only thing
+        that knows where that cube belongs relative to the drawing.
 
         Bounding boxes are not enough, for two reasons that show up as a mesh
         sitting visibly wrong against the drawing.
@@ -870,7 +1005,7 @@ class TrellisAdapter(SurfacingAdapter):
                 best = fit
 
         if best is None:  # degenerate strokes or a zero-extent mesh
-            return
+            return None
         residual, scale, translation, rotation = best
         mesh.vertices = (mesh.vertices @ rotation.T) * scale + translation
 
@@ -878,6 +1013,11 @@ class TrellisAdapter(SurfacingAdapter):
         log(f"'{unit.label}': fitted to sketch (scale {scale:.4g}, yaw "
             f"{_yaw_degrees(rotation):.0f}deg, mean stroke-to-surface "
             f"distance {100 * residual / extent:.2f}% of the sketch)")
+        return {
+            "rotation": [float(v) for v in rotation.reshape(-1)],
+            "scale": float(scale),
+            "translation": [float(v) for v in translation],
+        }
 
     def _run_worker(
         self,
@@ -889,14 +1029,19 @@ class TrellisAdapter(SurfacingAdapter):
         defines: dict[str, str],
         log: LogFn,
         on_progress: Callable[[float, str], None],
-    ) -> Path:
+    ) -> tuple[dict[str, Path], Optional[dict[str, Any]]]:
         """Drive one worker subprocess, translating its JSON events into
-        progress and log lines. Returns the mesh it wrote."""
+        progress and log lines.
+
+        Returns the files it wrote, keyed by role ("final" always; "raw" and
+        "frames" only when the run was asked for them), and the frame
+        manifest that goes with the capture."""
         cmd = [str(python), "-u", str(WORKER), str(config_path)]
         log_path = unit_dir / "worker.log"
         tail: list[str] = []
         error: Optional[str] = None
-        result: Optional[Path] = None
+        written: dict[str, Path] = {}
+        manifest: Optional[dict[str, Any]] = None
 
         with open(log_path, "w") as log_file:
             proc = spawn(
@@ -929,7 +1074,10 @@ class TrellisAdapter(SurfacingAdapter):
                         f"{label}: {event.get('message') or event['stage']}",
                     )
                 elif kind == "mesh":
-                    result = Path(event["path"])
+                    written[event.get("kind", "final")] = Path(event["path"])
+                elif kind == "frames":
+                    written["frames"] = Path(event["path"])
+                    manifest = event.get("manifest")
                 elif kind == "error":
                     error = event["message"]
             code = proc.wait()
@@ -940,9 +1088,10 @@ class TrellisAdapter(SurfacingAdapter):
                 f" (full log: {log_path})"
                 + ("\n" + "\n".join(tail) if tail else "")
             )
-        if result is None or not result.is_file():
+        final = written.get("final")
+        if final is None or not final.is_file():
             raise RuntimeError(
                 f"trellis finished without producing a mesh for '{label}' "
                 f"(full log: {log_path})"
             )
-        return result
+        return written, manifest

@@ -31,6 +31,18 @@ which `engine/SurfacePreview.ts` shows as a derived scene overlay — never
 part of the document or undo stack. One adapter per surfacing method on the
 python side; each real method runs in its own environment via subprocess.
 
+Adapters can also publish non-geometry artifacts on the same partial channel,
+tagged with a `kind` the client routes on. TRELLIS uses it for two opt-in
+extras: the mesh before postprocessing, and a capture of what its two flow
+stages did. The capture is one u8 occupancy volume per sampling step
+(`surfacing/trellisFrames.ts` decodes the container), rendered by
+`engine/VolumeGrid.ts` as a raymarched 3D texture and laid out into regions by
+`engine/TrellisInteractive.ts`, with `ui/trellis-interactive/` driving it. That
+view is modal — tools are off, the document's strokes are hidden and the
+regions hold copies — and everything it holds is in memory only: frames are
+never serialized into the document and never written to disk, so Clear ends
+the run for good.
+
 ## Rendering
 
 One requestAnimationFrame loop in `engine/Viewport.ts`. Scene changes call

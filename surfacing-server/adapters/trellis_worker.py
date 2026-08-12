@@ -99,6 +99,208 @@ def load_views(paths: list[str]) -> list[object]:
     return images
 
 
+GRID = 64  # edge of the occupancy grid the sparse-structure decoder produces
+
+
+def to_texture_bytes(volume):
+    """A [x, y, z] TRELLIS-frame volume as bytes for a WebGL 3D texture.
+
+    Two reorderings at once, both of which have to match the client exactly:
+
+    * TRELLIS works z-up, the document is y-up, and the mesh already gets the
+      same change of basis before export. World (x, y, z) = (x_t, z_t, -y_t),
+      so the third axis is transposed into place and then reversed.
+    * WebGL wants x varying fastest, which is the opposite of C order, so the
+      axes are reversed again on the way out.
+
+    The result addresses voxel (a, b, c) at world position
+    ((a + 0.5)/GRID - 0.5, ...) — a unit cube centred on the origin, which is
+    the frame the FlexiCubes mesh comes out in.
+    """
+    import numpy as np
+
+    world = np.transpose(volume, (0, 2, 1))[:, :, ::-1]
+    return np.ascontiguousarray(np.transpose(world, (2, 1, 0))).tobytes()
+
+
+def capture_structure_frames(pipeline, samples, log):
+    """One u8 occupancy field per sparse-structure step.
+
+    The stored value is `sigmoid(logit) * 255`, not a bit: the pipeline's own
+    threshold is `logit > 0`, which lands exactly on code 128, so the binary
+    grid is recoverable while the near-threshold voxels — the ones an
+    inpainting prior would be fighting for — survive the trip. A linear
+    quantization of the raw logits would spend most of its codes on the
+    saturated tails and none where it matters.
+    """
+    import torch
+
+    decoder = pipeline.models["sparse_structure_decoder"]
+    frames = []
+    for latent in samples.pred_x_0:
+        with torch.no_grad():
+            field = torch.sigmoid(decoder(latent).float())[0, 0]
+        volume = (field.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+        frames.append(to_texture_bytes(volume))
+        del field
+    log(f"captured {len(frames)} structure frame(s) at {GRID}^3")
+    return frames
+
+
+def capture_slat_frames(samples, coords, log):
+    """One u8 field per SLAT step, holding distance from the final latent.
+
+    SLAT never touches occupancy — the voxel set is fixed by stage one — so
+    what is worth watching is *where* the latent is still moving. Each frame
+    stores per-voxel ||x0_i - x0_final||, normalized across the whole
+    timeline so the colour scale is comparable between steps: bright early,
+    dark once that voxel has settled.
+
+    Costs nothing to compute. The sampler already retained every pred_x_0;
+    upstream just drops them.
+    """
+    import numpy as np
+    import torch
+
+    final = samples.pred_x_0[-1].feats
+    distances = [
+        (step.feats - final).norm(dim=1).float().cpu().numpy()
+        for step in samples.pred_x_0
+    ]
+    peak = max((float(d.max()) for d in distances), default=0.0) or 1.0
+
+    index = coords[:, 1:].long().cpu().numpy()
+    frames = []
+    for distance in distances:
+        volume = np.zeros((GRID, GRID, GRID), dtype=np.uint8)
+        volume[index[:, 0], index[:, 1], index[:, 2]] = np.clip(
+            distance / peak * 255.0, 0, 255
+        ).astype(np.uint8)
+        frames.append(to_texture_bytes(volume))
+    log(f"captured {len(frames)} latent frame(s) over {len(index)} voxel(s)")
+    return frames
+
+
+def run_pipeline(pipeline, images, config, capture, log):
+    """`run_multi_image`, inlined so the per-step latents survive.
+
+    Nothing here is a hook or a patched sampler: `FlowEulerSampler.sample`
+    already returns `pred_x_0` for every step and upstream's convenience
+    method reads only `.samples` off it. This is the same calls in the same
+    order, keeping the return value.
+
+    That order is load-bearing. `torch.manual_seed` runs once for *both*
+    stages and each sampler draws its own noise from the stream, so moving a
+    call — or adding one that draws — changes the noise and the same seed
+    stops reproducing earlier runs. Capture is read-only for exactly that
+    reason: it decodes latents that already exist and never touches the RNG.
+
+    Returns the mesh, and the captured frames when `capture` is on.
+    """
+    import torch
+
+    from trellis.modules import sparse as sp
+
+    if config["preprocess"]:
+        images = [pipeline.preprocess_image(image) for image in images]
+    cond = pipeline.get_cond(images)
+    cond["neg_cond"] = cond["neg_cond"][:1]
+    torch.manual_seed(config["seed"])
+    mode = config["mode"]
+
+    progress("sparse_structure", 0.0, "sampling structure")
+    flow_model = pipeline.models["sparse_structure_flow_model"]
+    reso = flow_model.resolution
+    noise = torch.randn(
+        1, flow_model.in_channels, reso, reso, reso
+    ).to(pipeline.device)
+    ss_params = {
+        **pipeline.sparse_structure_sampler_params,
+        "steps": config["ss_steps"],
+        "cfg_strength": config["ss_cfg"],
+    }
+    with pipeline.inject_sampler_multi_image(
+        "sparse_structure_sampler", len(images), ss_params["steps"], mode=mode
+    ):
+        structure = pipeline.sparse_structure_sampler.sample(
+            flow_model, noise, **cond, **ss_params, verbose=True
+        )
+    decoder = pipeline.models["sparse_structure_decoder"]
+    coords = torch.argwhere(decoder(structure.samples) > 0)[:, [0, 2, 3, 4]].int()
+    log(f"structure: {coords.shape[0]} occupied voxel(s) of {GRID ** 3}")
+    if coords.shape[0] == 0:
+        raise RuntimeError(
+            "the structure stage produced an empty occupancy grid — usually "
+            "means the views had no foreground left after the alpha crop"
+        )
+    progress("sparse_structure", 1.0, "sampled")
+
+    progress("slat", 0.0, "sampling latent")
+    flow_model = pipeline.models["slat_flow_model"]
+    noise = sp.SparseTensor(
+        feats=torch.randn(coords.shape[0], flow_model.in_channels).to(
+            pipeline.device
+        ),
+        coords=coords,
+    )
+    slat_params = {
+        **pipeline.slat_sampler_params,
+        "steps": config["slat_steps"],
+        "cfg_strength": config["slat_cfg"],
+    }
+    with pipeline.inject_sampler_multi_image(
+        "slat_sampler", len(images), slat_params["steps"], mode=mode
+    ):
+        latent = pipeline.slat_sampler.sample(
+            flow_model, noise, **cond, **slat_params, verbose=True
+        )
+    std = torch.tensor(pipeline.slat_normalization["std"])[None].to(
+        pipeline.device
+    )
+    mean = torch.tensor(pipeline.slat_normalization["mean"])[None].to(
+        pipeline.device
+    )
+    slat = latent.samples * std + mean
+    progress("slat", 1.0, "sampled")
+
+    frames = None
+    if capture:
+        progress("capture", 0.0, "decoding flow frames")
+        frames = {
+            "structure": capture_structure_frames(pipeline, structure, log),
+            "latent": capture_slat_frames(latent, coords, log),
+        }
+        progress("capture", 1.0, "captured")
+
+    progress("decode", 0.0, "decoding mesh")
+    return pipeline.decode_slat(slat, ["mesh"])["mesh"][0], frames
+
+
+def write_frames(frames, directory):
+    """Frames to disk as one flat file plus a manifest.
+
+    Down the pipe would mean base64 through a line-delimited JSON protocol
+    that also carries the log; a job-directory file costs one read in the
+    adapter and keeps the two channels apart. It is deleted with the rest of
+    the job directory (`prune_job_dirs`) — nothing about the capture is meant
+    to outlive the run.
+    """
+    blob = directory / "frames.bin"
+    manifest = {"grid": GRID, "stages": []}
+    with open(blob, "wb") as handle:
+        for stage in ("structure", "latent"):
+            offset = handle.tell()
+            for frame in frames[stage]:
+                handle.write(frame)
+            manifest["stages"].append({
+                "name": stage,
+                "offset": offset,
+                "steps": len(frames[stage]),
+            })
+    (directory / "frames.json").write_text(json.dumps(manifest))
+    _emit("frames", path=str(blob), manifest=manifest)
+
+
 def postprocess(vertices, faces, config):
     """TRELLIS's own mesh cleanup, as far as this machine can run it.
 
@@ -235,31 +437,9 @@ def main() -> None:
     log(f"{len(images)} conditioning view(s), mode={config['mode']}")
     progress("condition", 1.0, "")
 
-    # The seam for the interactive work: both samplers take their parameters
-    # here, and the occupancy grid the first stage produces is decoded inside
-    # `run_multi_image`. Watching either evolve means stepping the samplers
-    # from this file instead of calling the convenience method, and emitting a
-    # frame per step — the protocol above already carries arbitrary events.
-    progress("sparse_structure", 0.0, "sampling structure")
-    outputs = pipeline.run_multi_image(
-        images,
-        seed=config["seed"],
-        formats=["mesh"],  # skips the gaussian and radiance-field decoders
-        preprocess_image=config["preprocess"],
-        mode=config["mode"],
-        sparse_structure_sampler_params={
-            "steps": config["ss_steps"],
-            "cfg_strength": config["ss_cfg"],
-        },
-        slat_sampler_params={
-            "steps": config["slat_steps"],
-            "cfg_strength": config["slat_cfg"],
-        },
+    mesh, frames = run_pipeline(
+        pipeline, images, config, bool(config.get("interactive")), log
     )
-    progress("slat", 1.0, "sampled")
-
-    progress("decode", 0.15, "extracting mesh")
-    mesh = outputs["mesh"][0]
     if not mesh.success:
         raise RuntimeError(
             "the decoder produced an empty mesh — usually means the views had "
@@ -269,16 +449,31 @@ def main() -> None:
 
     vertices = mesh.vertices.detach().cpu().numpy()
     faces = mesh.faces.detach().cpu().numpy()
-    vertices, faces = postprocess(vertices, faces, config)
     # TRELLIS works z-up in a normalized cube; the document (and three.js) is
     # y-up. Same rotation postprocessing_utils.to_glb applies before writing.
-    vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    axes = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    out = Path(config["out"])
+
+    # The unprocessed mesh is written first and separately, so the viewer can
+    # show what simplification and hole filling actually removed. It is an
+    # order of magnitude larger than the delivered one (simplify_ratio is the
+    # fraction of faces *removed*), which is why it is opt-in.
+    if config.get("keep_raw"):
+        raw = out.with_name(f"{out.stem}_raw{out.suffix}")
+        trimesh.Trimesh(vertices @ axes, faces).export(raw)
+        log(f"raw mesh: {len(vertices)} vertices, {len(faces)} faces")
+        _emit("mesh", path=str(raw), kind="raw")
+
+    vertices, faces = postprocess(vertices, faces, config)
+    vertices = vertices @ axes
     log(f"mesh: {len(vertices)} vertices, {len(faces)} faces")
 
-    out = Path(config["out"])
     trimesh.Trimesh(vertices, faces).export(out)
     progress("decode", 1.0, "done")
     _emit("mesh", path=str(out), kind="final")
+
+    if frames is not None:
+        write_frames(frames, out.parent)
 
 
 if __name__ == "__main__":

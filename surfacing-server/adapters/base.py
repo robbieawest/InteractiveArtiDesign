@@ -5,11 +5,13 @@ from typing import Any, Callable, Optional
 ProgressFn = Callable[..., None]
 # log(line) — free-form text streamed to the client's log window
 LogFn = Callable[[str], None]
-# emit(name, glb) — a piece of the result that is already final (typically one
-# part), published while the job keeps running so the client can show geometry
-# before the whole thing is done. Optional: a method with nothing meaningful to
-# show until the end simply never calls it.
-EmitFn = Callable[[str, bytes], None]
+# emit(name, data, kind="glb") — a piece of the result that is already final
+# (typically one part), published while the job keeps running so the client can
+# show geometry before the whole thing is done. Optional: a method with nothing
+# meaningful to show until the end simply never calls it. `kind` other than
+# "glb" marks an adapter-specific artifact the client routes somewhere besides
+# the viewport.
+EmitFn = Callable[..., None]
 
 
 class SurfacingAdapter(ABC):
