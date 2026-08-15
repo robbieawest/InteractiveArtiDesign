@@ -289,6 +289,103 @@ def conditioner_params() -> list[dict[str, Any]]:
     return out
 
 
+# --- sketch voxelization --------------------------------------------------
+
+# Edge of the occupancy grid the sparse-structure VAE works at. The encoder
+# wants [B, 1, 64, 64, 64]; the decoder produces the same.
+OCCUPANCY_GRID = 64
+# Spacing, in voxels, at which a polyline is resampled before rasterizing. Below
+# 1 no cell along the segment can be skipped; 0.4 leaves margin for the
+# diagonal case without making the point count silly.
+STROKE_SAMPLE_SPACING = 0.4
+# How much of the cube's width the sketch's longest axis is scaled to. TRELLIS
+# objects are normalized to fill the unit cube, so the sketch should too — but
+# not to the very edge, since the model routinely adds volume the drawing never
+# had (a thicker back, a base) and that volume needs somewhere to go.
+CUBE_FILL = 0.9
+
+
+def _voxelize_strokes(unit: "Unit", log: LogFn) -> tuple[Any, dict[str, Any]]:
+    """The unit's strokes as a 64^3 binary grid in TRELLIS's frame, plus the
+    similarity that maps that cube back onto the drawing.
+
+    Two changes of basis are folded together here, and both have to match what
+    the rest of the pipeline already does or the constraint lands rotated
+    inside the volume it is meant to constrain.
+
+    *Normalization.* The sketch is centred on its bounding box and scaled
+    uniformly so its longest axis spans `CUBE_FILL` of the cube. Uniform, not
+    per-axis: anisotropic scaling would hand the model a sheared object and the
+    prior would complete a sheared one back.
+
+    *Handedness.* The document is y-up, TRELLIS is z-up. `main` in the worker
+    exports meshes through `axes = [[1,0,0],[0,0,-1],[0,1,0]]`, i.e. world
+    (x, y, z) = (x_t, z_t, -y_t). This is that map inverted — x_t = x_w,
+    y_t = -z_w, z_t = y_w — so the grid written here is in the same frame the
+    decoder's output is read in.
+
+    The returned align is the exact inverse of the normalization (identity
+    rotation, since the strokes define the frame rather than being searched
+    for in it), in the same form `_fit` returns: world = scale * R @ v + t,
+    for a mesh already in the y-up unit cube.
+    """
+    import numpy as np  # server env
+
+    points = [
+        np.asarray(s["points"], dtype=float)
+        for s in unit.strokes if len(s.get("points") or []) > 0
+    ]
+    if not points:
+        raise ValueError("no stroke points to build a sketch constraint from")
+
+    every = np.vstack(points)
+    low, high = every.min(axis=0), every.max(axis=0)
+    centre = (low + high) / 2
+    extent = float(np.max(high - low))
+    if not np.isfinite(extent) or extent <= 0:
+        raise ValueError("the strokes have no extent to normalize")
+    scale = extent / CUBE_FILL  # world units per unit of the cube
+
+    grid = np.zeros((OCCUPANCY_GRID,) * 3, dtype=np.uint8)
+    for stroke in points:
+        cube = (stroke - centre) / scale
+        # y-up world -> z-up TRELLIS, then cube coords -> voxel coords
+        trellis = np.column_stack([cube[:, 0], -cube[:, 2], cube[:, 1]])
+        voxel = (trellis + 0.5) * OCCUPANCY_GRID
+
+        if len(voxel) == 1:
+            dense = voxel
+        else:
+            # resample along arc length so no cell on a long segment is
+            # stepped over; a stroke is a polyline, not a point cloud
+            steps = np.linalg.norm(np.diff(voxel, axis=0), axis=1)
+            arc = np.concatenate([[0.0], np.cumsum(steps)])
+            if arc[-1] <= 0:
+                dense = voxel[:1]
+            else:
+                count = max(2, int(np.ceil(arc[-1] / STROKE_SAMPLE_SPACING)) + 1)
+                where = np.linspace(0.0, arc[-1], count)
+                dense = np.column_stack(
+                    [np.interp(where, arc, voxel[:, axis]) for axis in range(3)]
+                )
+
+        index = np.clip(
+            np.floor(dense).astype(int), 0, OCCUPANCY_GRID - 1
+        )
+        grid[index[:, 0], index[:, 1], index[:, 2]] = 1
+
+    occupied = int(grid.sum())
+    log(f"'{unit.label}': sketch voxelized to {occupied} of "
+        f"{OCCUPANCY_GRID ** 3} cells "
+        f"({100 * occupied / OCCUPANCY_GRID ** 3:.2f}%)")
+    align = {
+        "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        "scale": float(scale),
+        "translation": [float(v) for v in centre],
+    }
+    return grid, align
+
+
 # --- fitting --------------------------------------------------------------
 
 # Yaw candidates for the orientation search, over the full turn. Not tied to
@@ -447,6 +544,80 @@ class TrellisAdapter(SurfacingAdapter):
             "help": "How the strokes are turned into the images the model "
             "conditions on. This is the experimental axis of the method: "
             "TRELLIS sees nothing of the sketch except through here.",
+        },
+        {
+            "name": "no_image_cond",
+            "label": "Experiment: no image conditioning",
+            "type": "bool",
+            "default": False,
+            "help": "Zero the DINOv2 features so both flow stages run off the "
+            "unconditional branch. The views are still rendered and sent, "
+            "they just reach the model as zeros. Guidance stops meaning "
+            "anything — cond and neg_cond are both zero, so CFG cancels — and "
+            "the multi-view injection is skipped. Expect an arbitrary object: "
+            "the question this answers is whether the prior alone produces a "
+            "coherent shell or mush.",
+        },
+        {
+            "name": "sketch_inpaint",
+            "label": "Experiment: sketch inpainting",
+            "type": "bool",
+            "default": False,
+            "help": "Constrain the structure stage with the strokes "
+            "themselves. The sketch is voxelized to 64^3, encoded to the 16^3 "
+            "latent grid with the sparse-structure encoder (not part of the "
+            "pipeline — downloaded and loaded on demand, then released), and "
+            "mixed back into the running latent at every step, noised to that "
+            "step's time. This is the only channel that carries actual 3D "
+            "geometry into the model. Independent of the image switch above; "
+            "the two combine.",
+        },
+        {
+            "name": "sketch_mask",
+            "label": "Experiment: sketch constraint region",
+            "type": "choice",
+            "default": "touched",
+            "choices": ["touched", "dilated", "none"],
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
+            "help": "Which latent cells the constraint is written into. "
+            "'touched' is the cells whose 4^3 voxel block a stroke passes "
+            "through. 'dilated' grows that by one cell in each direction, a "
+            "cushion so the prior meets the constraint across a soft edge "
+            "rather than a hard step. 'none' is unmasked — the mix is applied "
+            "to the whole grid, which is the version that does not pretend "
+            "the 4x downsampling leaves a clean per-cell fact to overwrite.",
+        },
+        {
+            "name": "sketch_weight",
+            "label": "Experiment: sketch constraint weight",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
+            "help": "Lerp weight toward the noised sketch latent: the cell "
+            "becomes (1-w)*current + w*sketch. It means different things either "
+            "side of the mask switch. Masked, 1.0 is a plain overwrite of the "
+            "stroke cells and is the natural setting. Unmasked, 0.5 is the "
+            "plain average of the two grids and is the natural setting — 1.0 "
+            "there replaces the whole object with the wireframe and is not a "
+            "useful run.",
+        },
+        {
+            "name": "sketch_release",
+            "label": "Experiment: release constraint below t",
+            "type": "float",
+            "default": 0.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
+            "help": "Stop applying the constraint once the flow time drops "
+            "below this, leaving the last steps free to reconcile the "
+            "constrained cells with their neighbours. 0 constrains all the way "
+            "to t=0, which makes the final latent hold the sketch exactly "
+            "wherever the mix was full.",
         },
         {
             "name": "seed",
@@ -722,6 +893,11 @@ class TrellisAdapter(SurfacingAdapter):
             "slat_steps": int(options.pop("slat_steps", 12)),
             "slat_cfg": float(options.pop("slat_cfg", 3.0)),
             "preprocess": bool(options.pop("preprocess", True)),
+            "no_image_cond": bool(options.pop("no_image_cond", False)),
+            "sketch_inpaint": bool(options.pop("sketch_inpaint", False)),
+            "sketch_mask": str(options.pop("sketch_mask", "touched")),
+            "sketch_weight": float(options.pop("sketch_weight", 1.0)),
+            "sketch_release": float(options.pop("sketch_release", 0.0)),
             "interactive": interactive,
             "keep_raw": bool(options.pop("keep_raw", False)),
             "simplify_ratio": float(options.pop("simplify_ratio", 0.9)),
@@ -820,11 +996,28 @@ class TrellisAdapter(SurfacingAdapter):
     ) -> "UnitResult":
         """Generate one unit and return its mesh in sketch world coordinates,
         together with whatever extras this run was asked to record."""
+        import numpy as np  # server env
         import trimesh  # server env
+
+        extra: dict[str, Any] = {}
+        # The frame the constraint is written in is the frame the result comes
+        # back in, so the orientation search below has nothing left to find:
+        # `_fit` sweeps yaw because TRELLIS normally builds in an arbitrary
+        # canonical frame, and voxelizing the sketch into the cube is exactly
+        # what stops that being true. Keep the inverse normalization instead —
+        # it is exact, and a 72-candidate ICP against a shape the strokes
+        # already pin can only move it off.
+        sketch_align: Optional[dict[str, Any]] = None
+        if config.get("sketch_inpaint"):
+            grid, sketch_align = _voxelize_strokes(unit, log)
+            sketch_path = unit_dir / "sketch.npy"
+            np.save(sketch_path, grid)
+            extra["sketch"] = str(sketch_path)
 
         config_path = unit_dir / "config.json"
         config_path.write_text(json.dumps({
             **config,
+            **extra,
             "views": [str(p) for p in images],
             "out": str(unit_dir / "mesh.glb"),
         }, indent=2))
@@ -839,7 +1032,17 @@ class TrellisAdapter(SurfacingAdapter):
         # before the fit, not after: stray fragments are noise in the
         # stroke-to-surface score the registration minimizes
         loaded = self._drop_small_components(loaded, min_component, unit, log)
-        align = self._fit(loaded, unit, log) if fit else None
+        if not fit:
+            align = None
+        elif sketch_align is not None:
+            align = sketch_align
+            loaded.vertices = (
+                loaded.vertices * align["scale"] + align["translation"]
+            )
+            log(f"'{unit.label}': placed by the sketch constraint's own frame "
+                f"(scale {align['scale']:.4g}); orientation search skipped")
+        else:
+            align = self._fit(loaded, unit, log)
 
         # The raw mesh is a second view of the same object, not a second
         # object: it takes the transform solved on the processed one rather

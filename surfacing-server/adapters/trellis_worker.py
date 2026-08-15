@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import traceback
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 # This file sits in the server's adapters/ directory, so python puts that
@@ -100,6 +101,83 @@ def load_views(paths: list[str]) -> list[object]:
 
 
 GRID = 64  # edge of the occupancy grid the sparse-structure decoder produces
+# Edge of the latent grid the structure flow model samples. The VAE is three
+# resolution levels with two stride-2 blocks between them (decoder channels
+# [512, 128, 32]), so 16 -> 32 -> 64: one latent cell per 4^3 voxel block.
+LATENT_GRID = 16
+LATENT_STRIDE = GRID // LATENT_GRID
+# Where the sparse-structure *encoder* comes from. The pipeline does not carry
+# it — generation only ever needs the decoder — so it is fetched and loaded on
+# demand, and dropped again once the sketch is encoded.
+SS_ENCODER = "microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16"
+
+
+def encode_sketch(config, device, log):
+    """The sketch's occupancy grid as a latent, with the cells it touches.
+
+    Returns `(z_sketch, mask)` — the [1, 8, 16, 16, 16] posterior mean and a
+    [1, 1, 16, 16, 16] float field saying where the constraint applies — or
+    None if this run is not constrained.
+
+    The encoder is loaded here rather than with the pipeline and released
+    immediately after. It is a few hundred MB that is useless to generation,
+    it is only needed once per unit, and the flow transformers peak high enough
+    on this card that holding it for the whole run is not free.
+
+    `sample_posterior=False` because training consumed the posterior mean, not
+    a draw from it: the flow model's data distribution is the means. Drawing
+    here would add variance the model never saw. Stage-1 latents are also not
+    normalized — unlike SLat there are no mean/std stats — so the encoder's
+    output is the flow input directly.
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    path = config.get("sketch")
+    if not path:
+        return None
+
+    grid = np.load(path)
+    occupied = int(grid.sum())
+    if occupied == 0:
+        raise RuntimeError(
+            "the sketch voxelized to an empty grid — nothing to constrain with"
+        )
+    volume = torch.from_numpy(grid).to(device).float()[None, None]
+
+    import trellis.models as models
+
+    log(f"loading the sparse-structure encoder ({SS_ENCODER.split('/')[-1]})")
+    encoder = models.from_pretrained(SS_ENCODER).eval().to(device)
+    try:
+        with torch.no_grad():
+            latent = encoder(volume, sample_posterior=False)
+    finally:
+        del encoder
+        torch.cuda.empty_cache()
+    if not torch.isfinite(latent).all():
+        raise RuntimeError("the sketch encoded to a non-finite latent")
+
+    # A cell is "touched" if any voxel in its 4^3 block holds a stroke. Max
+    # pooling is that, exactly, and matches the stride the VAE downsamples at.
+    mode = str(config.get("sketch_mask", "touched"))
+    if mode == "none":
+        mask = torch.ones(
+            1, 1, LATENT_GRID, LATENT_GRID, LATENT_GRID, device=device
+        )
+    else:
+        mask = F.max_pool3d(volume, LATENT_STRIDE)
+        if mode == "dilated":
+            # one cell of cushion in every direction, so the prior meets the
+            # constraint across a soft edge rather than a hard step
+            mask = F.max_pool3d(mask, 3, stride=1, padding=1)
+
+    touched = int(mask.sum().item())
+    log(f"sketch: {occupied} voxel(s) of {GRID ** 3} -> mask '{mode}' over "
+        f"{touched} of {LATENT_GRID ** 3} latent cell(s) "
+        f"({100 * touched / LATENT_GRID ** 3:.1f}%)")
+    return latent.float(), mask
 
 
 def to_texture_bytes(volume):
@@ -181,6 +259,96 @@ def capture_slat_frames(samples, coords, log):
     return frames
 
 
+@contextmanager
+def inject_sketch_constraint(sampler, sketch, config, log):
+    """Mix the noised sketch latent into the structure sampler at every step.
+
+    The flow's forward marginal is `x_t = (1-t) * x_0 + (sigma_min +
+    (1-sigma_min) * t) * eps` — read straight off `FlowEulerSampler`'s
+    `_eps_to_xstart`. So the sketch's state at any time is computable in closed
+    form, and the constraint is: after each Euler step lands on `t_prev`, pull
+    the latent toward where the sketch would be at `t_prev`.
+
+    Applied to `pred_x_prev` rather than to the model input, which is the same
+    place but the honest one — the next step's model call reads it, and the
+    step's own prediction is left as the model made it so the captured
+    `pred_x_0` still shows what the prior wanted rather than what it was told.
+
+    `eps` is drawn once and reused for every step. Redrawing (what RePaint
+    does, and what its resampling loop needs) makes the constraint jitter
+    between steps; with a fixed draw the sketch follows one coherent
+    trajectory down to `x_0`, which is what a constraint should look like.
+
+    Nothing here is a patched sampler in the checkout: `sample_once` is
+    swapped on the instance for the duration and put back after, the same
+    shape as upstream's own `inject_sampler_multi_image` (which patches
+    `_inference_model`, so the two compose).
+    """
+    import torch
+
+    if sketch is None:
+        yield
+        return
+
+    latent, mask = sketch
+    weight = float(config.get("sketch_weight", 1.0))
+    release = float(config.get("sketch_release", 0.0))
+    sigma_min = sampler.sigma_min
+    blend = (weight * mask).to(latent.dtype)
+    eps = torch.randn_like(latent)
+    log(f"sketch constraint: weight {weight:g}, "
+        f"{'held to t=0' if release <= 0 else f'released below t={release:g}'}")
+    if str(config.get("sketch_mask")) == "none" and weight > 0.75:
+        log("warning: unmasked mixing at this weight replaces the whole "
+            "object with the wireframe — 0.5 is the plain average")
+
+    original = sampler.sample_once
+
+    def sample_once(model, x_t, t, t_prev, cond=None, **kwargs):
+        out = original(model, x_t, t, t_prev, cond, **kwargs)
+        if t_prev >= release:
+            scale = sigma_min + (1 - sigma_min) * t_prev
+            dtype = out.pred_x_prev.dtype
+            known = ((1 - t_prev) * latent + scale * eps).to(dtype)
+            out.pred_x_prev = out.pred_x_prev + blend.to(dtype) * (
+                known - out.pred_x_prev
+            )
+        return out
+
+    sampler.sample_once = sample_once
+    try:
+        yield
+    finally:
+        # delete rather than reassign: `sample_once` lives on the class, and
+        # putting the bound method back as an instance attribute would leave
+        # the sampler permanently shadowed by a closure over this run
+        del sampler.sample_once
+
+
+def report_sketch_coverage(config, coords, log):
+    """How much of the sketch the finished occupancy grid actually contains.
+
+    The one number that says whether the constraint took. It is not the
+    experiment's score — that is IoU against a known object, measured away
+    from the strokes — but a low number here means the run failed mechanically
+    rather than the prior failing to complete anything.
+    """
+    import numpy as np
+
+    path = config.get("sketch")
+    if not path:
+        return
+    grid = np.load(path)
+    index = coords[:, 1:].long().cpu().numpy()
+    occupied = np.zeros((GRID, GRID, GRID), dtype=bool)
+    occupied[index[:, 0], index[:, 1], index[:, 2]] = True
+    wanted = grid.astype(bool)
+    hit = int((occupied & wanted).sum())
+    total = int(wanted.sum())
+    log(f"sketch coverage: {hit}/{total} stroke voxel(s) occupied "
+        f"({100 * hit / max(total, 1):.1f}%)")
+
+
 def run_pipeline(pipeline, images, config, capture, log):
     """`run_multi_image`, inlined so the per-step latents survive.
 
@@ -205,8 +373,44 @@ def run_pipeline(pipeline, images, config, capture, log):
         images = [pipeline.preprocess_image(image) for image in images]
     cond = pipeline.get_cond(images)
     cond["neg_cond"] = cond["neg_cond"][:1]
-    torch.manual_seed(config["seed"])
+
+    # The unconditional branch. Zeroing after get_cond rather than skipping it
+    # keeps the token shape the flow models expect — they take a cond tensor,
+    # not an optional one, and the branch this selects is the one training
+    # taught by dropping the image on 10% of steps. cond and neg_cond are then
+    # identical, so CFG cancels whatever its strength; and the multi-view
+    # injection has nothing left to cycle through, so it is skipped (in
+    # 'stochastic' it would deal out one identical row per step, and its
+    # index list is sized to the step count).
     mode = config["mode"]
+    unconditional = bool(config.get("no_image_cond"))
+    if unconditional:
+        before = float(cond["cond"].abs().max())
+        cond = {
+            "cond": torch.zeros_like(cond["cond"][:1]),
+            "neg_cond": torch.zeros_like(cond["cond"][:1]),
+        }
+        after = float(cond["cond"].abs().max())
+        log(f"image conditioning off: DINOv2 tokens {tuple(cond['cond'].shape)} "
+            f"max|x| {before:.4g} -> {after:.4g}, guidance inert (cond == "
+            "neg_cond), multi-view injection skipped")
+
+    def multi_image(sampler_name, steps):
+        if unconditional:
+            return nullcontext()
+        return pipeline.inject_sampler_multi_image(
+            sampler_name, len(images), steps, mode=mode
+        )
+
+    torch.manual_seed(config["seed"])
+
+    # Draws nothing from the RNG (`sample_posterior=False` takes the posterior
+    # mean), so it is safe here between the seed and the noise below. The
+    # constraint's own noise is drawn later, when the context manager opens,
+    # which is after the sampler's starting noise — so a constrained run and an
+    # unconstrained one at the same seed begin from the same x_1 and differ
+    # only by the constraint.
+    sketch = encode_sketch(config, pipeline.device, log)
 
     progress("sparse_structure", 0.0, "sampling structure")
     flow_model = pipeline.models["sparse_structure_flow_model"]
@@ -219,10 +423,10 @@ def run_pipeline(pipeline, images, config, capture, log):
         "steps": config["ss_steps"],
         "cfg_strength": config["ss_cfg"],
     }
-    with pipeline.inject_sampler_multi_image(
-        "sparse_structure_sampler", len(images), ss_params["steps"], mode=mode
-    ):
-        structure = pipeline.sparse_structure_sampler.sample(
+    sampler = pipeline.sparse_structure_sampler
+    with multi_image("sparse_structure_sampler", ss_params["steps"]), \
+            inject_sketch_constraint(sampler, sketch, config, log):
+        structure = sampler.sample(
             flow_model, noise, **cond, **ss_params, verbose=True
         )
     decoder = pipeline.models["sparse_structure_decoder"]
@@ -233,6 +437,7 @@ def run_pipeline(pipeline, images, config, capture, log):
             "the structure stage produced an empty occupancy grid — usually "
             "means the views had no foreground left after the alpha crop"
         )
+    report_sketch_coverage(config, coords, log)
     progress("sparse_structure", 1.0, "sampled")
 
     progress("slat", 0.0, "sampling latent")
@@ -248,9 +453,7 @@ def run_pipeline(pipeline, images, config, capture, log):
         "steps": config["slat_steps"],
         "cfg_strength": config["slat_cfg"],
     }
-    with pipeline.inject_sampler_multi_image(
-        "slat_sampler", len(images), slat_params["steps"], mode=mode
-    ):
+    with multi_image("slat_sampler", slat_params["steps"]):
         latent = pipeline.slat_sampler.sample(
             flow_model, noise, **cond, **slat_params, verbose=True
         )
