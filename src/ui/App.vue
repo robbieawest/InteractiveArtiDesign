@@ -333,7 +333,6 @@ import { ExplodeTool } from "../tools/ExplodeTool";
 import BottomPanels, { type PanelName } from "./BottomPanels.vue";
 import BenchmarkWindow from "./BenchmarkWindow.vue";
 import * as benchmark from "../benchmark/store";
-import { readSketch } from "../surfacing/benchmarkClient";
 import { SketchDocument } from "../core/SketchDocument";
 import {
   UndoStack,
@@ -1266,7 +1265,7 @@ async function openBenchmarkSketch(name: string): Promise<void> {
   const benchmarkId = benchmark.state.id;
   if (!benchmarkId) return;
   try {
-    const json = await readSketch(benchmarkId, name);
+    const json = await benchmark.readSketchDocument(name);
     selectTool?.deselect();
     clearSurface();
     doc.clear();
@@ -1306,8 +1305,18 @@ async function openBenchmarkSketch(name: string): Promise<void> {
     }
     benchmarkOpen.value = false;
   } catch (error) {
-    alert(`Could not open benchmark sketch: ${error}`);
+    // capped: an alert is a modal the user has to dismiss, so whatever the
+    // failure was it must not arrive as a screenful of text
+    alert(`Could not open benchmark sketch: ${brief(error)}`);
   }
+}
+
+/** An error as one readable line. */
+function brief(error: unknown): string {
+  const text = String(error instanceof Error ? error.message : error)
+    .trim()
+    .replace(/\s+/g, " ");
+  return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 
 /** Write the edited document back into the benchmark's sketches/ folder.

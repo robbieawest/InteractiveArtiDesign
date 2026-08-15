@@ -129,6 +129,10 @@ export const state = reactive<BenchmarkState>({
  *  1.8GB sweep costs nothing until one is read. Kept out of `state` for the
  *  same reason `partials` is — a File has no place in a reactive object. */
 const localResults = new Map<string, File>();
+/** Stored sketch documents of a locally-opened benchmark, by name. Kept for
+ *  the same reason as `localResults`: the editor reads one back when a
+ *  thumbnail is clicked, and there is no server to ask. */
+const localSketches = new Map<string, File>();
 
 /** Geometry published by the cell being surfaced *right now*, and nothing
  *  else. A sweep produces hundreds of megabytes of mesh; none of it is cached
@@ -261,6 +265,7 @@ export async function prepare(): Promise<void> {
   // of a locally-opened one — with no server it fails loudly, which is right
   state.local = false;
   localResults.clear();
+  localSketches.clear();
   state.phase = "preparing";
   state.error = null;
   state.sketches = [];
@@ -373,6 +378,7 @@ export async function reopen(benchmarkId: string): Promise<void> {
     state.editMode = false;
     clearPartials();
     localResults.clear();
+    localSketches.clear();
 
     const saved = (await api.loadProgress(benchmarkId)) as Partial<
       BenchmarkState
@@ -537,7 +543,9 @@ export async function openLocal(files: File[]): Promise<void> {
     state.sourceDir = "";
     clearPartials();
     localResults.clear();
+    localSketches.clear();
     for (const [key, file] of found.results) localResults.set(key, file);
+    for (const [name, file] of found.sketches) localSketches.set(name, file);
 
     const saved = found.progress
       ? (JSON.parse(await found.progress.text()) as Partial<BenchmarkState>)
@@ -638,6 +646,21 @@ async function readSurface(
     // rather than failing the whole load
     return null;
   }
+}
+
+/** One of the benchmark's stored sketch documents, for the editor to open.
+ *
+ *  Routed here rather than called directly so a locally-opened benchmark reads
+ *  its picked File instead of asking a server that is not there — on a static
+ *  host that request comes back as the fallback HTML page, not a document. */
+export async function readSketchDocument(name: string): Promise<DocumentJson> {
+  if (state.local) {
+    const file = localSketches.get(name);
+    if (!file) throw new Error(`${name} is not in this benchmark folder`);
+    return JSON.parse(await file.text()) as DocumentJson;
+  }
+  if (!state.id) throw new Error("no benchmark open");
+  return api.readSketch(state.id, name);
 }
 
 /** The viewed run's finished surface for one sketch, for the editor to show

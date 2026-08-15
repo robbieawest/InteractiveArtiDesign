@@ -8,6 +8,7 @@
 // the client converts, and the converted documents go back to the server.
 
 import type { DocumentJson } from "../core/serialization";
+import { request } from "./http";
 
 /** One surfaceable input found in a source folder. `gltf` entries still need
  *  client-side conversion; `json` entries are ready to run, which is what
@@ -149,22 +150,3 @@ export function newBenchmarkId(now = new Date()): string {
   );
 }
 
-async function request(url: string, init?: RequestInit): Promise<Response> {
-  let response: Response;
-  try {
-    response = await fetch(url, init);
-  } catch {
-    throw new Error(OFFLINE_HINT);
-  }
-  if (response.status === 500 || response.status === 502 || response.status === 504) {
-    throw new Error(OFFLINE_HINT);
-  }
-  if (!response.ok) {
-    throw new Error(await response.text().catch(() => response.statusText));
-  }
-  return response;
-}
-
-const OFFLINE_HINT =
-  "surfacing server unreachable — start it with " +
-  "`uvicorn server:app --port 8801` in surfacing-server/ (see its README)";

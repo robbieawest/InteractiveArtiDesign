@@ -5,6 +5,7 @@
 import type { SketchDocument } from "../core/SketchDocument";
 import type { Joint } from "../core/types";
 import { rotateVec } from "../core/rigid";
+import { request } from "./http";
 
 /** What a surfacing method receives: world-space stroke centerlines tagged
  *  with part ids, plus the part and joint tables. Baseline methods use the
@@ -300,27 +301,6 @@ export async function runSurfacingJob(
     await pullLog().catch(() => {});
   }
 }
-
-async function request(url: string, init?: RequestInit): Promise<Response> {
-  let response: Response;
-  try {
-    response = await fetch(url, init);
-  } catch {
-    throw new Error(OFFLINE_HINT);
-  }
-  if (response.status === 500 || response.status === 502 || response.status === 504) {
-    // what the Vite proxy returns when nothing listens on the server port
-    throw new Error(OFFLINE_HINT);
-  }
-  if (!response.ok) {
-    throw new Error(await response.text().catch(() => response.statusText));
-  }
-  return response;
-}
-
-const OFFLINE_HINT =
-  "surfacing server unreachable — start it with " +
-  "`uvicorn server:app --port 8801` in surfacing-server/ (see its README)";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
