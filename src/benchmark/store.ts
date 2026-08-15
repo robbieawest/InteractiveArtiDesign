@@ -97,6 +97,12 @@ export interface BenchmarkState {
   editing: string | null;
   /** Benchmark folders on disk, for the reopen picker. */
   benchmarks: BenchmarkSummary[];
+  /** Opened from a folder the user picked in the browser rather than from the
+   *  server. Implies read-only: the surfaces are Files we can read but not
+   *  write next to, and there is no server to run anything. Everything that
+   *  would reach the server is refused, and the UI hides the controls that
+   *  would try. This is the mode the GitHub Pages build runs in. */
+  local: boolean;
 }
 
 export const state = reactive<BenchmarkState>({
@@ -115,7 +121,14 @@ export const state = reactive<BenchmarkState>({
   editMode: false,
   editing: null,
   benchmarks: [],
+  local: false,
 });
+
+/** Result .glb files of a locally-opened benchmark, keyed by cellKey. Files,
+ *  not bytes: the picker hands over lazy handles, so holding every result of a
+ *  1.8GB sweep costs nothing until one is read. Kept out of `state` for the
+ *  same reason `partials` is — a File has no place in a reactive object. */
+const localResults = new Map<string, File>();
 
 /** Geometry published by the cell being surfaced *right now*, and nothing
  *  else. A sweep produces hundreds of megabytes of mesh; none of it is cached
@@ -244,6 +257,10 @@ export async function loadMethods(): Promise<void> {
  *  benchmarks/<id>/sketches/, so re-selecting that folder later reruns the
  *  same set with no preprocessing at all. */
 export async function prepare(): Promise<void> {
+  // preparing writes a new benchmark to the server, so it is also the way out
+  // of a locally-opened one — with no server it fails loudly, which is right
+  state.local = false;
+  localResults.clear();
   state.phase = "preparing";
   state.error = null;
   state.sketches = [];
@@ -347,6 +364,7 @@ export async function reopen(benchmarkId: string): Promise<void> {
   state.message = `loading ${benchmarkId}`;
 
   try {
+    state.local = false;
     state.id = benchmarkId;
     state.sketches = [];
     state.scanned = [];
@@ -354,11 +372,12 @@ export async function reopen(benchmarkId: string): Promise<void> {
     state.editing = null;
     state.editMode = false;
     clearPartials();
+    localResults.clear();
 
     const saved = (await api.loadProgress(benchmarkId)) as Partial<
       BenchmarkState
     > | null;
-    state.runs = saved?.runs ?? {};
+    state.runs = dedupeRuns(saved?.runs ?? {});
     state.status = saved?.status ?? {};
     state.sourceDir = saved?.sourceDir ?? "";
     state.viewing = saved?.viewing ?? null;
@@ -385,6 +404,187 @@ export async function reopen(benchmarkId: string): Promise<void> {
           : `${done}/${total} surfaces — ${
               done === total ? "complete" : "resume to continue"
             }`;
+  } catch (exc) {
+    state.phase = "error";
+    state.error = exc instanceof Error ? exc.message : String(exc);
+  }
+}
+
+/** Drop runs that repeat an id within one adapter.
+ *
+ *  A run id is a folder name and half of `cellKey`, so duplicates are not a
+ *  cosmetic problem: two runs sharing an id read each other's status and each
+ *  other's surfaces, which silently puts the wrong parameters next to a mesh.
+ *  Older progress.json files have them (a rerun that renumbered from the run
+ *  count while a run had been removed). The first entry wins, because that is
+ *  the one whose parameters produced the folder's contents. */
+function dedupeRuns(runs: Record<string, BenchRun[]>): Record<string, BenchRun[]> {
+  const cleaned: Record<string, BenchRun[]> = {};
+  for (const [adapter, list] of Object.entries(runs ?? {})) {
+    const seen = new Set<string>();
+    const kept: BenchRun[] = [];
+    for (const run of list ?? []) {
+      if (seen.has(run.id)) {
+        console.warn(
+          `benchmark: ${adapter} lists run "${run.id}" more than once — ` +
+            "keeping the first, dropping the rest",
+        );
+        continue;
+      }
+      seen.add(run.id);
+      kept.push(run);
+    }
+    cleaned[adapter] = kept;
+  }
+  return cleaned;
+}
+
+/** One benchmark folder as the directory picker hands it over. */
+interface LocalBenchmark {
+  id: string;
+  /** sketch name -> its stored document file */
+  sketches: Map<string, File>;
+  /** cellKey -> the .glb on disk */
+  results: Map<string, File>;
+  /** adapter -> run ids that have a folder, in the order they were found */
+  runDirs: Map<string, Set<string>>;
+  progress: File | null;
+}
+
+/** Sort a picked folder into the layout a benchmark is written in:
+ *  <id>/progress.json, <id>/sketches/<name>.json and
+ *  <id>/<adapter>/<run>/<sketch>.glb. Nothing is read here — these are lazy
+ *  handles, and a sweep's worth of .glb is more than a tab can hold. */
+function sortLocalFolder(files: File[]): LocalBenchmark {
+  const relative = (file: File) =>
+    (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
+    file.name;
+
+  const found: LocalBenchmark = {
+    id: relative(files[0] ?? new File([], "")).split("/")[0] ?? "benchmark",
+    sketches: new Map(),
+    results: new Map(),
+    runDirs: new Map(),
+    progress: null,
+  };
+
+  for (const file of files) {
+    const segments = relative(file).split("/");
+    const name = segments[segments.length - 1];
+    const lower = name.toLowerCase();
+
+    // <id>/progress.json
+    if (segments.length === 2 && lower === "progress.json") {
+      found.progress = file;
+      continue;
+    }
+    // <id>/sketches/<name>.json
+    if (segments.length === 3 && segments[1] === "sketches" && lower.endsWith(".json")) {
+      found.sketches.set(name.replace(/\.json$/i, ""), file);
+      continue;
+    }
+    // <id>/<adapter>/<run>/<sketch>.glb
+    if (segments.length === 4 && lower.endsWith(".glb")) {
+      const [, adapter, run] = segments;
+      const sketch = name.replace(/\.glb$/i, "");
+      found.results.set(cellKey(adapter, run, sketch), file);
+      const runs = found.runDirs.get(adapter) ?? new Set<string>();
+      runs.add(run);
+      found.runDirs.set(adapter, runs);
+    }
+  }
+  return found;
+}
+
+/** Open a benchmark folder picked in the browser — the client-side twin of
+ *  `reopen`, and the only way in when there is no surfacing server.
+ *
+ *  A benchmark folder is self-describing, so nothing here needs the server: the
+ *  sketches are documents, progress.json holds the runs and their parameters,
+ *  and the surfaces sit under <adapter>/<run>/. Two deliberate departures from
+ *  `reopen`:
+ *
+ *  - a cell is `done` because its .glb exists, not because progress.json says
+ *    so. For a viewer the files on disk are the truth, and this is what makes a
+ *    folder that was copied out of a half-finished sweep still show everything
+ *    it actually contains.
+ *  - runs missing from progress.json are recovered from the result folders, so
+ *    a benchmark with no progress.json at all is still viewable.
+ *
+ *  Read-only from here on: `state.local` refuses everything that writes. */
+export async function openLocal(files: File[]): Promise<void> {
+  if (state.phase === "running" || state.phase === "pausing") return;
+  state.phase = "loading";
+  state.error = null;
+
+  try {
+    const found = sortLocalFolder(files);
+    if (found.sketches.size === 0) {
+      throw new Error(
+        "no sketches/ folder here — pick a single benchmark folder " +
+          "(the one holding progress.json and sketches/), not the folder of them",
+      );
+    }
+
+    state.local = true;
+    state.id = found.id;
+    state.sketches = [];
+    state.scanned = [];
+    state.benchmarks = [];
+    state.active = null;
+    state.editing = null;
+    state.editMode = false;
+    state.sourceDir = "";
+    clearPartials();
+    localResults.clear();
+    for (const [key, file] of found.results) localResults.set(key, file);
+
+    const saved = found.progress
+      ? (JSON.parse(await found.progress.text()) as Partial<BenchmarkState>)
+      : null;
+    state.runs = dedupeRuns(saved?.runs ?? {});
+    state.status = saved?.status ?? {};
+    state.viewing = saved?.viewing ?? null;
+
+    // recover any run that has a folder but no entry — including every run of
+    // a benchmark with no progress.json
+    for (const [adapter, runIds] of found.runDirs) {
+      const runs = state.runs[adapter] ?? (state.runs[adapter] = []);
+      for (const id of [...runIds].sort()) {
+        if (!runs.some((r) => r.id === id)) {
+          runs.push({ id, label: id, options: {} });
+        }
+      }
+    }
+
+    // the adapter list normally comes from the server; here the runs we just
+    // loaded are the whole of it. No params: there is nothing to configure,
+    // and each run's stored options are shown read-only instead.
+    state.methods = Object.keys(state.runs)
+      .sort()
+      .map((name) => ({ name, params: [] }));
+
+    // files on disk beat progress.json — see above
+    resetInFlight();
+    for (const key of localResults.keys()) {
+      setCell(key, { state: "done", progress: 1, message: "" });
+    }
+
+    for (const [name, file] of [...found.sketches].sort((a, b) =>
+      a[0].localeCompare(b[0]),
+    )) {
+      state.message = `loading ${name}`;
+      await addSketch(name, JSON.parse(await file.text()) as DocumentJson);
+    }
+
+    if (!state.viewing) state.viewing = firstViewing();
+    await refreshViewedThumbnails();
+
+    state.phase = "idle";
+    const { done } = overallTally();
+    state.message =
+      `${state.sketches.length} sketch(es), ${done} surface(s) — ` +
+      "read-only, no surfacing server";
   } catch (exc) {
     state.phase = "error";
     state.error = exc instanceof Error ? exc.message : String(exc);
@@ -428,6 +628,10 @@ async function readSurface(
 ): Promise<ArrayBuffer | null> {
   if (!state.id) return null;
   try {
+    if (state.local) {
+      const file = localResults.get(cellKey(adapter, run, sketch));
+      return file ? await file.arrayBuffer() : null;
+    }
     return await api.readResult(state.id, adapter, run, sketch);
   } catch {
     // the file is gone from under us: show the cell without its surface
@@ -494,7 +698,7 @@ export async function saveEdit(
   name: string,
   document: DocumentJson,
 ): Promise<void> {
-  if (!state.id) return;
+  if (!state.id || state.local) return;
   await api.saveSketch(state.id, name, document);
 
   const doc = deserializeDocument(document);
@@ -568,6 +772,8 @@ export async function start(only?: RunRef): Promise<void> {
   if (state.phase === "running" || state.phase === "pausing" || !state.id) {
     return;
   }
+  if (state.local) return; // nothing to run against
+
   abort = new AbortController();
   pauseRequested = false;
   state.phase = "running";
@@ -855,7 +1061,9 @@ let persistWarned = false;
  *  instead of being swallowed entirely (silence here hid a server bug that
  *  rejected every save). */
 async function persist(): Promise<void> {
-  if (!state.id) return;
+  // a locally-opened benchmark has no server to write to, and the picked
+  // folder is not ours to change
+  if (!state.id || state.local) return;
   try {
     await api.saveProgress(state.id, {
       runs: state.runs,

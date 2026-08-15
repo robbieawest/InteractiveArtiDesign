@@ -8,7 +8,7 @@
       <aside class="config">
         <h2>Benchmark</h2>
 
-        <section>
+        <section v-if="!store.state.local">
           <h3>Sketches</h3>
           <div class="row">
             <input v-model="dirInput" class="grow" placeholder="folder of sketches"
@@ -33,14 +33,24 @@
         <section>
           <div class="row">
             <h3 class="grow">Load</h3>
-            <button class="small" :disabled="busy"
+            <button v-if="!store.state.local" class="small" :disabled="busy"
                     title="Rescan the benchmarks folder"
                     @click="doRefreshBenchmarks">↻</button>
           </div>
-          <p v-if="!store.state.benchmarks.length" class="hint">
-            No saved benchmarks yet.
+
+          <button class="wide" :disabled="busy"
+                  title="Pick a benchmark folder from anywhere on this machine — the one holding progress.json and sketches/ — and view its results. Everything is read in the browser: nothing is uploaded, whatever the folder picker's warning says, and no surfacing server is involved."
+                  @click="doOpenLocal">Open folder…</button>
+          <p v-if="store.state.local" class="hint">
+            Read-only: viewing <span class="mono">{{ store.state.id }}</span> from
+            a picked folder. Nothing here can be run or edited.
           </p>
-          <div v-for="bench in store.state.benchmarks" :key="bench.id"
+
+          <template v-if="!store.state.local">
+            <p v-if="!store.state.benchmarks.length" class="hint">
+              No saved benchmarks yet.
+            </p>
+            <div v-for="bench in store.state.benchmarks" :key="bench.id"
                class="bench" :class="{ current: bench.id === store.state.id }">
             <span class="mono">{{ bench.id }}</span>
             <span class="hint">
@@ -55,21 +65,25 @@
               <button class="small" :disabled="busy"
                       title="Start a new benchmark from these sketches and run configuration, with none of the surfaces — this folder is left untouched"
                       @click="doCleanCopy(bench.id)">Clean copy</button>
+              </div>
             </div>
-          </div>
+          </template>
         </section>
 
         <section>
           <h3>Adapters</h3>
           <p v-if="!store.state.methods.length" class="hint">
-            No surfacing server — start it and reopen this window.
+            {{ store.state.local
+              ? "This benchmark has no results to compare."
+              : "No surfacing server — start it, or use Open folder… to view a benchmark read-only." }}
           </p>
           <div v-for="method in store.state.methods" :key="method.name" class="adapter">
             <div class="row">
               <strong class="grow">{{ method.name }}</strong>
               <TallyBar v-if="store.state.runs[method.name]?.length"
                         :tally="store.adapterTally(method.name)" />
-              <button class="small" :disabled="busy" @click="store.addRun(method.name)">
+              <button v-if="!store.state.local" class="small" :disabled="busy"
+                      @click="store.addRun(method.name)">
                 + run
               </button>
             </div>
@@ -87,6 +101,7 @@
                   {{ run.label }}
                 </button>
                 <TallyBar :tally="store.runTally(method.name, run.id)" />
+                <template v-if="!store.state.local">
                 <button class="small" :disabled="busy || isComplete(method.name, run.id)"
                         :title="isComplete(method.name, run.id)
                           ? 'Every sketch of this run is done'
@@ -97,8 +112,21 @@
                         @click="doRerun(method.name, run.id)">↻</button>
                 <button class="small" :disabled="busy"
                         @click="store.removeRun(method.name, run.id)">✕</button>
+                </template>
               </div>
               <template v-if="!collapsed.has(runKey(method.name, run.id))">
+                <!-- read-only: there are no adapter params without a server,
+                     but the options the run was made with are the whole point
+                     of comparing two runs, so show them as stored -->
+                <template v-if="store.state.local">
+                  <div v-for="(value, name) in run.options" :key="name" class="param">
+                    <label>{{ name }}</label>
+                    <span class="mono">{{ value }}</span>
+                  </div>
+                  <p v-if="!Object.keys(run.options).length" class="hint">
+                    No parameters recorded.
+                  </p>
+                </template>
                 <div v-for="param in method.params" :key="param.name" class="param"
                      :class="{ disabled: !paramEnabled(param, run) }" :title="param.help">
                   <label>{{ param.label }}</label>
@@ -126,7 +154,7 @@
         </section>
 
         <section class="actions">
-          <div class="row">
+          <div v-if="!store.state.local" class="row">
             <button v-if="!running" :disabled="!canStart"
                     :title="resumable
                       ? 'Continue this benchmark. Surfaces already finished are kept and skipped.'
@@ -166,7 +194,7 @@
             {{ store.state.viewing.adapter }} / {{ store.state.viewing.run }}
           </span>
           <span v-else class="hint">Add a run to see per-sketch status</span>
-          <label class="edit-toggle"
+          <label v-if="!store.state.local" class="edit-toggle"
                  :class="{ disabled: running }"
                  :title="running
                    ? 'Not while a benchmark is running — editing an input mid-sweep would break the comparison'
@@ -203,7 +231,9 @@
             </figcaption>
           </figure>
           <p v-if="!store.state.sketches.length" class="hint empty">
-            Select a folder and prepare it to populate the grid.
+            {{ store.state.local
+              ? "This folder has no sketches."
+              : "Select a folder and prepare it, or Open folder… to view a saved benchmark." }}
           </p>
         </div>
       </main>
@@ -246,6 +276,9 @@ const gltfCount = computed(
 );
 
 onMounted(() => {
+  // both are server calls: skipped once a locally-opened benchmark is on
+  // screen, since loadMethods would wipe the adapter list built from its runs
+  if (store.state.local) return;
   if (!store.state.methods.length) void store.loadMethods().catch(() => {});
   void store.refreshBenchmarks().catch(() => {});
 });
@@ -312,6 +345,22 @@ function doSelect(): void {
     } catch (exc) {
       store.state.error = exc instanceof Error ? exc.message : String(exc);
     }
+  };
+  input.click();
+}
+
+/** Pick a saved benchmark folder and view it read-only. Same directory input
+ *  as doSelect — the only folder picker a browser offers — but pointed at a
+ *  written benchmark rather than a folder of inputs. */
+function doOpenLocal(): void {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.webkitdirectory = true;
+  input.multiple = true;
+  input.onchange = () => {
+    const files = [...(input.files ?? [])];
+    if (files.length === 0) return;
+    void store.openLocal(files);
   };
   input.click();
 }
@@ -506,6 +555,9 @@ function setOption(
 .small {
   padding: 0 5px;
   font-size: 11px;
+}
+.wide {
+  width: 100%;
 }
 .hint {
   color: #777;
