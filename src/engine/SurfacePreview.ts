@@ -10,6 +10,7 @@ import {
   type JointPose,
 } from "../core/articulation";
 import { identityRigid } from "../core/rigid";
+import { getSurfaceMatcap, injectFresnelRim } from "./surfaceMatcap";
 import type { SurfacingSketch } from "../surfacing/client";
 
 /** Appearance of the surface overlay, editable from the Surfacer panel. */
@@ -478,80 +479,11 @@ function asArray(m: THREE.Material | THREE.Material[]): THREE.Material[] {
  *  fresnel rim injected so the silhouette reads even at low opacity. */
 function buildSurfaceMaterial(): THREE.MeshMatcapMaterial {
   const material = new THREE.MeshMatcapMaterial({
-    matcap: getMatcap(),
+    matcap: getSurfaceMatcap(),
     side: THREE.DoubleSide,
     transparent: true,
   });
-  material.onBeforeCompile = (shader) => {
-    shader.uniforms.rimColor = { value: new THREE.Color(0xffffff) };
-    shader.uniforms.rimPower = { value: 2.2 };
-    shader.uniforms.rimStrength = { value: 0.5 };
-    shader.fragmentShader =
-      "uniform vec3 rimColor;\nuniform float rimPower;\nuniform float rimStrength;\n" +
-      shader.fragmentShader.replace(
-        "#include <opaque_fragment>",
-        // abs() so back faces (double-sided) rim too; normal & vViewPosition
-        // are both in view space here
-        `float rimDot = 1.0 - abs(dot(normalize(normal), normalize(vViewPosition)));
-         outgoingLight += rimColor * (pow(rimDot, rimPower) * rimStrength);
-         #include <opaque_fragment>`,
-      );
-  };
+  injectFresnelRim(material, new THREE.Color(0xffffff), 0.5, 2.2, "add");
   return material;
 }
 
-let sharedMatcap: THREE.Texture | null = null;
-
-function getMatcap(): THREE.Texture {
-  if (!sharedMatcap) sharedMatcap = makeMatcapTexture();
-  return sharedMatcap;
-}
-
-/** A soft studio matcap drawn procedurally (no asset dependency): a sphere lit
- *  from the upper-left, bright falling to dark, with a soft specular hotspot.
- *  Grayscale so the material colour tints it by multiplication. */
-function makeMatcapTexture(): THREE.Texture {
-  const size = 256;
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#2b2b2b";
-  ctx.fillRect(0, 0, size, size);
-
-  const diffuse = ctx.createRadialGradient(
-    size * 0.36,
-    size * 0.3,
-    size * 0.04,
-    size * 0.5,
-    size * 0.5,
-    size * 0.62,
-  );
-  diffuse.addColorStop(0, "#ffffff");
-  diffuse.addColorStop(0.5, "#b8b8b8");
-  diffuse.addColorStop(1, "#454545");
-  ctx.fillStyle = diffuse;
-  ctx.beginPath();
-  ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
-  ctx.fill();
-
-  const spec = ctx.createRadialGradient(
-    size * 0.33,
-    size * 0.27,
-    0,
-    size * 0.33,
-    size * 0.27,
-    size * 0.2,
-  );
-  spec.addColorStop(0, "rgba(255,255,255,0.85)");
-  spec.addColorStop(1, "rgba(255,255,255,0)");
-  ctx.fillStyle = spec;
-  ctx.beginPath();
-  ctx.arc(size * 0.33, size * 0.27, size * 0.2, 0, Math.PI * 2);
-  ctx.fill();
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.needsUpdate = true;
-  return texture;
-}

@@ -2,6 +2,7 @@ node_modules
 dist
 .venv*/
 surfacing-server/jobs
+surfacing-server/debug
 __pycache__
 *.local
 .DS_Store

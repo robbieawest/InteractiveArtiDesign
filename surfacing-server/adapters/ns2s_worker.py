@@ -10,12 +10,26 @@ Protocol: one JSON request per line on stdin, one JSON event per line on
 stdout. Requests are
 
     {"input": <dir>, "output": <dir>, "threshold": f, "margin": f,
-     "img_size": i}
+     "img_size": i, "volume": bool, "blur": f}
 
 and the reply is one {"event": "file", "name": ..., "ok": bool} per .obj
 found, then {"event": "done", "count": n} — or {"event": "error", ...} if the
 whole request failed. Anything the model prints goes to stderr so it cannot
 corrupt the stream.
+
+With "volume" set the run stops at the network's output: each input writes its
+raw occupancy probabilities as `<stem>_prob.u8` plus a `<stem>_prob.json`
+describing the grid, and no marching cubes runs. A mesh extracted at one
+threshold has already thrown the probabilities away, and they are the thing
+the client raymarches (and the thing an inpainting signal is made of).
+
+With "volume" and "mesh" both set it writes the grid *and* meshes it, from the
+same forward pass and the same blurred field — marching cubes at "threshold",
+largest component, normals repaired, exactly what `process_and_save` does after
+its own sigmoid. That combination exists because two consumers want the same
+prediction: TRELLIS conditions on renders of the mesh and constrains sampling
+with the field, and running the network twice for them is a minute of GPU and
+13GB of residency for an answer that is already in hand.
 """
 
 import glob
@@ -64,6 +78,166 @@ def main() -> None:
             send({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
 
 
+def predict_field(engine, obj_path, img_size, margin, blur=0.0):
+    """One forward pass: the occupancy probabilities and the normalization.
+
+    Returns `(field, params)`, or `(None, None)` when the sketch has too few
+    points to voxelize. `field` is float in [0, 1] on the method's own
+    `img_size ** 3` grid, already blurred if asked for — everything
+    downstream (the quantized grid, the marching cubes, an inpainting
+    constraint) reads this one array, so they cannot disagree about what was
+    predicted.
+
+    `blur` is a Gaussian over the field in voxels, applied to the
+    probabilities before anything looks at them. Clamped edges and a 3σ
+    truncation, matching `engine/volumeBlur.ts`, so the client's own slider is
+    the same operator applied twice over rather than a different one.
+    """
+    import torch
+
+    from inference import voxelize_strict_aligned
+
+    input_np, params = voxelize_strict_aligned(obj_path, img_size, margin)
+    if input_np is None:
+        return None, None
+
+    with torch.no_grad():
+        logits = engine.model(torch.from_numpy(input_np).to(engine.device))
+        probs = torch.sigmoid(logits)
+    field = probs.cpu().numpy()[0, 0]
+
+    if blur > 0:
+        from scipy.ndimage import gaussian_filter
+
+        field = gaussian_filter(field, sigma=blur, mode="nearest", truncate=3.0)
+    return field, params
+
+
+def write_probability_grid(field, params, out_stem, blur) -> None:
+    """The field as the two files the client and the adapters read.
+
+    Two of them, because the payload is a fixed-stride block and everything
+    else is small:
+
+    * `<stem>.u8`  — `img_size ** 3` bytes, `round(p * 255)`, ordered with x
+      varying fastest so the client can hand it to a WebGL 3D texture with no
+      further work (the same convention as the TRELLIS capture).
+    * `<stem>.json` — the grid edge, the similarity that puts the unit cube
+      the texture addresses back onto the sketch, and the blur that was
+      applied.
+
+    The alignment inverts the method's own normalization. `voxelize_strict_aligned`
+    maps a vertex to `n = (v - center) * scale` and samples voxel i (of R) at
+    `n = -margin + i * voxel_size`; a unit cube centred on the origin
+    addresses that same voxel at `x = (i + 0.5) / R - 0.5`. Eliminating i
+    gives `n = x * 2 * margin * R / (R - 1)` — no offset, since the grid is
+    symmetric about the origin — and so
+    `world = x * 2 * margin * R / ((R - 1) * scale) + center`, which is a
+    scale and a translation with no rotation in it.
+    """
+    import numpy as np
+
+    resolution = int(params["resolution"])
+    quantized = np.clip(field * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    # C order runs z fastest; a 3D texture wants x fastest
+    with open(f"{out_stem}.u8", "wb") as handle:
+        handle.write(np.ascontiguousarray(quantized.transpose(2, 1, 0)).tobytes())
+
+    scale = float(params["scale"])
+    with open(f"{out_stem}.json", "w") as handle:
+        json.dump(
+            {
+                "grid": resolution,
+                "align": {
+                    "rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+                    "scale": 2.0 * float(params["margin"]) * resolution
+                    / ((resolution - 1) * scale),
+                    "translation": [float(v) for v in params["center"]],
+                },
+                "blur": float(blur),
+                "max": float(field.max()),
+                "mean": float(field.mean()),
+            },
+            handle,
+        )
+
+
+def mesh_field(field, params, threshold, obj_out, npz_out) -> bool:
+    """Marching cubes on an already-predicted field, as `process_and_save`
+    would have done it.
+
+    Deliberately the same steps in the same order — cubes at `threshold`,
+    largest connected component, `fix_normals` — because this is a substitute
+    for that call, not a variant of it: a run that meshes from here should be
+    indistinguishable from a normal ns2s run at the same threshold and no
+    blur. The npz is written last and holds the field, so the adapter's
+    "is it finished" check (which watches for it) still means what it meant.
+    """
+    import numpy as np
+    import trimesh
+    from skimage import measure
+
+    if field.max() < threshold:
+        return False
+    verts, faces, _, _ = measure.marching_cubes(field, level=threshold)
+    verts = verts * params["voxel_size"] + params["origin"]
+    verts = verts / params["scale"] + params["center"]
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+    components = mesh.split(only_watertight=False)
+    if len(components) > 0:
+        mesh = max(components, key=lambda part: len(part.vertices))
+    mesh.fix_normals()
+    mesh.export(obj_out)
+    np.savez(
+        npz_out,
+        raw_probability_grid=field,
+        center=params["center"],
+        margin=float(params["margin"]),
+        resolution=int(params["resolution"]),
+        voxel_size=float(params["voxel_size"]),
+        o3d_origin=params["origin"],
+        scale=float(params["scale"]),
+    )
+    return True
+
+
+def save_probability_grid(
+    engine, obj_path, out_stem, img_size, margin, blur=0.0
+) -> bool:
+    """Run the network on one sketch and write its occupancy probabilities.
+
+    Everything `process_and_save` does after the sigmoid — marching cubes,
+    component pruning, normal repair — is a decision made at one threshold,
+    so this stops before it and keeps the field itself.
+    """
+    field, params = predict_field(engine, obj_path, img_size, margin, blur)
+    if field is None:
+        return False
+    write_probability_grid(field, params, out_stem, blur)
+    return True
+
+
+def save_grid_and_mesh(
+    engine, obj_path, out_stem, prob_stem, npz_path,
+    img_size, margin, threshold, blur=0.0
+) -> bool:
+    """One prediction, published both ways: the field and a mesh of it.
+
+    The mesh is marched on the same array that gets quantized, blur included,
+    so what a caller renders and what it thresholds are the same surface at
+    the same level — which is the whole reason this is one function and not
+    two calls.
+    """
+    field, params = predict_field(engine, obj_path, img_size, margin, blur)
+    if field is None:
+        return False
+    write_probability_grid(field, params, prob_stem, blur)
+    # the grid is worth keeping even if the mesh comes out empty: a caller
+    # constraining with it does not need the surface
+    return mesh_field(field, params, threshold, out_stem, npz_path)
+
+
 def handle(engine, request: dict, send) -> None:
     in_dir = request["input"]
     out_dir = request["output"]
@@ -78,14 +252,36 @@ def handle(engine, request: dict, send) -> None:
         stem = name[: -len(".obj")]
         ok = False
         try:
-            ok = engine.process_and_save(
-                path,
-                os.path.join(out_dir, f"{stem}_recon.obj"),
-                os.path.join(out_dir, f"{stem}_data.npz"),
-                int(request.get("img_size", 112)),
-                float(request.get("threshold", 0.6)),
-                float(request.get("margin", 1.2)),
-            )
+            if request.get("volume") and request.get("mesh"):
+                ok = save_grid_and_mesh(
+                    engine,
+                    path,
+                    os.path.join(out_dir, f"{stem}_recon.obj"),
+                    os.path.join(out_dir, f"{stem}_prob"),
+                    os.path.join(out_dir, f"{stem}_data.npz"),
+                    int(request.get("img_size", 112)),
+                    float(request.get("margin", 1.2)),
+                    float(request.get("threshold", 0.6)),
+                    float(request.get("blur", 0.0)),
+                )
+            elif request.get("volume"):
+                ok = save_probability_grid(
+                    engine,
+                    path,
+                    os.path.join(out_dir, f"{stem}_prob"),
+                    int(request.get("img_size", 112)),
+                    float(request.get("margin", 1.2)),
+                    float(request.get("blur", 0.0)),
+                )
+            else:
+                ok = engine.process_and_save(
+                    path,
+                    os.path.join(out_dir, f"{stem}_recon.obj"),
+                    os.path.join(out_dir, f"{stem}_data.npz"),
+                    int(request.get("img_size", 112)),
+                    float(request.get("threshold", 0.6)),
+                    float(request.get("margin", 1.2)),
+                )
         except Exception as exc:
             send({"event": "log", "message": f"{stem}: {exc}"})
         # one event per input, so the caller can publish geometry as it lands

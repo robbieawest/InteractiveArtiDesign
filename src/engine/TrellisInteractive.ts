@@ -78,6 +78,7 @@ export class TrellisInteractiveView {
   private readonly loader = new GLTFLoader();
   private readonly root = new THREE.Group();
 
+  private constraint: VolumeGrid | null = null;
   private structure: VolumeGrid | null = null;
   private latent: VolumeGrid | null = null;
   private processedMesh: THREE.Object3D | null = null;
@@ -120,6 +121,23 @@ export class TrellisInteractiveView {
     if (views) regions.push({ label: "conditioning views", content: views });
 
     regions.push({ label: "sketch", content: this.sketchCopy(run.sketch) });
+
+    if (run.frames?.stages.constraint.length) {
+      // The inpainting signal, before the stage it constrains — reading left
+      // to right is then "this is what the model was told, this is what it
+      // did with it". No threshold to draw and no ramp to read: the only
+      // values in it are one per constraint source (the strokes brighter than
+      // the predicted surface), and each drops out at its own release point.
+      this.constraint = new VolumeGrid({
+        ...DEFAULT_VOLUME_STYLE,
+        splitAtThreshold: false,
+        hazeColor: new THREE.Color(0x1f9d6b),
+      });
+      regions.push({
+        label: "inpainting signal — the grid mixed in at this step",
+        content: this.buildVolumeRegion(this.constraint, run),
+      });
+    }
 
     if (run.frames) {
       // occupancy: the field in blue, and red where it crosses the cut the
@@ -197,6 +215,9 @@ export class TrellisInteractiveView {
       // distance from the final latent, which has no such cut in it
       const { threshold: _ignored, ...shared } = state.volume;
       this.latent?.setStyle(shared);
+      // the constraint grid is binary — a threshold on it would be a cut
+      // through a field that only holds two values
+      this.constraint?.setStyle(shared);
     }
     if (state.showSketchOverlay !== undefined && this.sketchOverlay) {
       this.sketchOverlay.visible = state.showSketchOverlay;
@@ -220,6 +241,15 @@ export class TrellisInteractiveView {
       const structureFrame = this.frames.stages.structure[structureStep];
       if (structureFrame && this.structure) {
         this.structure.setVolume(structureFrame, this.frames.grid);
+      }
+
+      // Indexed by the structure step, not the timeline position: the
+      // constraint only ever acted during that stage, and it holds its last
+      // state (released, so empty) through the latent stage the same way the
+      // occupancy holds its own.
+      const constraintFrame = this.frames.stages.constraint[structureStep];
+      if (constraintFrame && this.constraint) {
+        this.constraint.setVolume(constraintFrame, this.frames.grid);
       }
 
       const latentStep = position - structure;
@@ -250,8 +280,10 @@ export class TrellisInteractiveView {
   clear(): void {
     // order matters: the volumes own their own geometry and textures and
     // dispose themselves, so they come out before the blanket sweep
+    this.constraint?.dispose();
     this.structure?.dispose();
     this.latent?.dispose();
+    this.constraint = null;
     this.structure = null;
     this.latent = null;
 

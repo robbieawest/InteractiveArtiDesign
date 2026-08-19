@@ -37,6 +37,14 @@ const DEFAULTS: Required<Omit<ViewSpec, "overrides">> = {
  *  degrees keeps a recognizable horizon in the image. */
 const MAX_PITCH = 1.4;
 
+/** Shading for a surfaced conditioning render (`renderSurfacedViews`). The
+ *  strokes' own colour is a compromise struck for thin geometry — a tube a few
+ *  pixels wide has to be light enough to survive the model's preprocessing —
+ *  and a solid filling the frame wants the opposite of that at its edges. */
+const SURFACED_ALBEDO = 0xe8e8e8;
+const SURFACED_CONTOUR = 0x3c3c3c;
+const SURFACED_CONTOUR_STRENGTH = 0.75;
+
 function styleFor(spec: ViewSpec): SketchRenderStyle {
   const merged = { ...DEFAULTS, ...spec };
   return {
@@ -106,6 +114,42 @@ export async function renderStrokeViews(
     sketch,
     [],
     styleFor(spec),
+    orbitDirections(count, pitch, layout, pitchMax),
+  );
+}
+
+/** Views of a surfaced sketch: the same cameras and the same framing, with a
+ *  shaded solid in place of the line art.
+ *
+ *  The strokes are left out rather than drawn over the surface. A model that
+ *  reconstructs what it is shown is exactly the thing this is trying to stop
+ *  showing a wireframe to, and strokes standing proud of the surface would put
+ *  some of it back — the sketch is already in the run as geometry, through the
+ *  inpainting constraint, which is where it belongs.
+ *
+ *  Opaque, and lit the same way: `styleFor` already pins `surfaceOpacity` to 1
+ *  because image models crop on alpha, and the surface picks up the same
+ *  colour the strokes would have had, so the only difference from a stroke
+ *  render is what is in the frame. */
+export async function renderSurfacedViews(
+  sketch: SurfacingSketch,
+  surface: ArrayBuffer,
+  spec: ViewSpec = {},
+): Promise<string[]> {
+  const { count, pitch, layout, pitchMax } = { ...DEFAULTS, ...spec };
+  return renderSketchViews(
+    { ...sketch, strokes: [] },
+    [surface],
+    {
+      ...styleFor(spec),
+      // Lighter than the strokes would have been, with the contour dropped to
+      // a dark grey: a solid needs the two ends of the range that line art
+      // gets for free, and the matcap alone leaves a pale object low-contrast
+      // against a pale background.
+      surfaceColor: SURFACED_ALBEDO,
+      surfaceContourColor: SURFACED_CONTOUR,
+      surfaceContourStrength: SURFACED_CONTOUR_STRENGTH,
+    },
     orbitDirections(count, pitch, layout, pitchMax),
   );
 }

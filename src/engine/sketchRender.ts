@@ -12,6 +12,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import type { SurfacingSketch } from "../surfacing/client";
+import { getSurfaceMatcap, injectFresnelRim } from "./surfaceMatcap";
 
 export interface SketchRenderStyle {
   /** Output is always square, `size` x `size` pixels. */
@@ -23,6 +24,16 @@ export interface SketchRenderStyle {
   strokeThickness: number;
   surfaceColor: number;
   surfaceOpacity: number;
+  /** Darken the contour — the silhouette and everything turning away from the
+   *  camera — toward this colour, by this much (0 disables it and leaves the
+   *  matcap's own shading alone).
+   *
+   *  Without it a light grey solid renders as a light grey blob: the matcap
+   *  carries form, but an image model reading a low-contrast interior has
+   *  little to go on and the object's own outline is the strongest depth cue
+   *  in the frame. Cheaper and more legible than trying to light it. */
+  surfaceContourColor?: number;
+  surfaceContourStrength?: number;
   /** Camera pullback as a multiple of the bounding radius. ~1.0 fills the
    *  frame; >1 leaves margin around the subject. */
   margin: number;
@@ -170,6 +181,31 @@ export function buildStrokes(
   return tubeStrokes(sketch, style, strokeRadius(sketch));
 }
 
+/** The same matcap the viewport overlay uses, so a surface looks like itself
+ *  wherever it is drawn, with the contour darkened rather than lightened —
+ *  see `surfaceContourColor`. */
+function buildSurfaceMaterial(
+  style: SketchRenderStyle,
+): THREE.MeshMatcapMaterial {
+  const material = new THREE.MeshMatcapMaterial({
+    matcap: getSurfaceMatcap(),
+    color: style.surfaceColor,
+    side: THREE.DoubleSide,
+    transparent: style.surfaceOpacity < 1,
+    opacity: style.surfaceOpacity,
+  });
+  if (style.surfaceContourStrength) {
+    injectFresnelRim(
+      material,
+      new THREE.Color(style.surfaceContourColor ?? 0x000000),
+      style.surfaceContourStrength,
+      2.0,
+      "toward",
+    );
+  }
+  return material;
+}
+
 /** The sketch plus whatever surface geometry has arrived so far (per-part
  *  partials, or the finished object), as one disposable group. */
 async function buildContent(
@@ -189,14 +225,12 @@ async function buildContent(
         // the glb's own material (and any texture hanging off it) is replaced
         // wholesale, so let go of it here rather than leaving it to the GC
         for (const original of asArray(mesh.material)) disposeMaterial(original);
-        mesh.material = new THREE.MeshStandardMaterial({
-          color: style.surfaceColor,
-          roughness: 0.6,
-          metalness: 0.0,
-          transparent: style.surfaceOpacity < 1,
-          opacity: style.surfaceOpacity,
-          side: THREE.DoubleSide,
-        });
+        // surfacing meshes (ns2s and VNS marching cubes, concatenated parts)
+        // export with positions only, and matcap shading needs normals
+        if (!mesh.geometry.getAttribute("normal")) {
+          mesh.geometry.computeVertexNormals();
+        }
+        mesh.material = buildSurfaceMaterial(style);
       }
     });
     content.add(gltf.scene);

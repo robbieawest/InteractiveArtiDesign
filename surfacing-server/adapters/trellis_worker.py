@@ -111,18 +111,35 @@ LATENT_STRIDE = GRID // LATENT_GRID
 # demand, and dropped again once the sketch is encoded.
 SS_ENCODER = "microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16"
 
+# The constraint sources, in the order their mixes are applied. Sketch last on
+# purpose: where two sources cover the same latent cell the later mix wins, and
+# the strokes are the thing the user actually drew — the surface is a guess
+# about everything between them.
+CONSTRAINT_SOURCES = ("surface", "sketch")
 
-def encode_sketch(config, device, log):
-    """The sketch's occupancy grid as a latent, with the cells it touches.
+# What each source is drawn at in the captured signal volume, so a glance at
+# the flow view says which one is still being applied. Densities, not colours:
+# the region renders occupancy, and the sketch sits on top at full strength.
+CONSTRAINT_DENSITY = {"surface": 150, "sketch": 255}
 
-    Returns `(z_sketch, mask)` — the [1, 8, 16, 16, 16] posterior mean and a
-    [1, 1, 16, 16, 16] float field saying where the constraint applies — or
-    None if this run is not constrained.
+
+def encode_constraints(config, device, log):
+    """Every constraint grid this run carries, encoded to latents with masks.
+
+    Returns a list of `{name, latent, mask, weight, release}` — the
+    [1, 8, 16, 16, 16] posterior mean and a [1, 1, 16, 16, 16] float field
+    saying where that source applies — empty when the run is unconstrained.
+
+    Kept as separate entries rather than one unioned grid so each source can be
+    mixed at its own weight and released at its own time. That is the only
+    reason they are separate: a single grid cannot express "hold the strokes to
+    the end but let the surface go early", which is the experiment.
 
     The encoder is loaded here rather than with the pipeline and released
-    immediately after. It is a few hundred MB that is useless to generation,
-    it is only needed once per unit, and the flow transformers peak high enough
-    on this card that holding it for the whole run is not free.
+    immediately after — once for all sources. It is a few hundred MB that is
+    useless to generation, it is only needed once per unit, and the flow
+    transformers peak high enough on this card that holding it for the whole
+    run is not free.
 
     `sample_posterior=False` because training consumed the posterior mean, not
     a draw from it: the flow model's data distribution is the means. Drawing
@@ -134,17 +151,26 @@ def encode_sketch(config, device, log):
     import torch
     import torch.nn.functional as F
 
-    path = config.get("sketch")
-    if not path:
-        return None
+    present = [
+        (name, config.get(name)) for name in CONSTRAINT_SOURCES
+        if config.get(name)
+    ]
+    if not present:
+        return []
 
-    grid = np.load(path)
-    occupied = int(grid.sum())
-    if occupied == 0:
-        raise RuntimeError(
-            "the sketch voxelized to an empty grid — nothing to constrain with"
+    volumes = []
+    for name, path in present:
+        grid = np.load(path)
+        occupied = int(grid.sum())
+        if occupied == 0:
+            raise RuntimeError(
+                f"the {name} constraint voxelized to an empty grid — nothing "
+                "to constrain with"
+            )
+        volumes.append(
+            (name, torch.from_numpy(grid).to(device).float()[None, None],
+             occupied)
         )
-    volume = torch.from_numpy(grid).to(device).float()[None, None]
 
     import trellis.models as models
 
@@ -152,32 +178,52 @@ def encode_sketch(config, device, log):
     encoder = models.from_pretrained(SS_ENCODER).eval().to(device)
     try:
         with torch.no_grad():
-            latent = encoder(volume, sample_posterior=False)
+            latents = [
+                encoder(volume, sample_posterior=False)
+                for _, volume, _ in volumes
+            ]
     finally:
         del encoder
         torch.cuda.empty_cache()
-    if not torch.isfinite(latent).all():
-        raise RuntimeError("the sketch encoded to a non-finite latent")
 
-    # A cell is "touched" if any voxel in its 4^3 block holds a stroke. Max
-    # pooling is that, exactly, and matches the stride the VAE downsamples at.
     mode = str(config.get("sketch_mask", "touched"))
-    if mode == "none":
-        mask = torch.ones(
-            1, 1, LATENT_GRID, LATENT_GRID, LATENT_GRID, device=device
-        )
-    else:
-        mask = F.max_pool3d(volume, LATENT_STRIDE)
-        if mode == "dilated":
-            # one cell of cushion in every direction, so the prior meets the
-            # constraint across a soft edge rather than a hard step
-            mask = F.max_pool3d(mask, 3, stride=1, padding=1)
 
-    touched = int(mask.sum().item())
-    log(f"sketch: {occupied} voxel(s) of {GRID ** 3} -> mask '{mode}' over "
-        f"{touched} of {LATENT_GRID ** 3} latent cell(s) "
-        f"({100 * touched / LATENT_GRID ** 3:.1f}%)")
-    return latent.float(), mask
+    constraints = []
+    for (name, volume, occupied), latent in zip(volumes, latents):
+        if not torch.isfinite(latent).all():
+            raise RuntimeError(
+                f"the {name} constraint encoded to a non-finite latent"
+            )
+        # A cell is "touched" if any voxel in its 4^3 block is set. Max pooling
+        # is that, exactly, and matches the stride the VAE downsamples at.
+        if mode == "none":
+            mask = torch.ones(
+                1, 1, LATENT_GRID, LATENT_GRID, LATENT_GRID, device=device
+            )
+        else:
+            mask = F.max_pool3d(volume, LATENT_STRIDE)
+            if mode == "dilated":
+                # one cell of cushion in every direction, so the prior meets
+                # the constraint across a soft edge rather than a hard step
+                mask = F.max_pool3d(mask, 3, stride=1, padding=1)
+
+        # The raw weight: it is a share against the other sources, not a mix
+        # against the prior, so the strength is applied later and separately.
+        weight = float(config.get(f"{name}_weight", 1.0))
+        release = float(config.get(f"{name}_release", 0.0))
+        touched = int((mask > 0).sum().item())
+        log(f"{name} constraint: {occupied} voxel(s) of {GRID ** 3} -> mask "
+            f"'{mode}' over {touched} of {LATENT_GRID ** 3} latent cell(s) "
+            f"({100 * touched / LATENT_GRID ** 3:.1f}%), share {weight:g}"
+            + ("" if release <= 0 else f", released below t={release:g}"))
+        constraints.append({
+            "name": name,
+            "latent": latent.float(),
+            "mask": mask,
+            "weight": weight,
+            "release": release,
+        })
+    return constraints
 
 
 def to_texture_bytes(volume):
@@ -260,8 +306,8 @@ def capture_slat_frames(samples, coords, log):
 
 
 @contextmanager
-def inject_sketch_constraint(sampler, sketch, config, log):
-    """Mix the noised sketch latent into the structure sampler at every step.
+def inject_sketch_constraint(sampler, constraints, config, log):
+    """Mix the noised constraint latents into the structure sampler each step.
 
     The flow's forward marginal is `x_t = (1-t) * x_0 + (sigma_min +
     (1-sigma_min) * t) * eps` — read straight off `FlowEulerSampler`'s
@@ -274,10 +320,36 @@ def inject_sketch_constraint(sampler, sketch, config, log):
     step's own prediction is left as the model made it so the captured
     `pred_x_0` still shows what the prior wanted rather than what it was told.
 
-    `eps` is drawn once and reused for every step. Redrawing (what RePaint
-    does, and what its resampling loop needs) makes the constraint jitter
-    between steps; with a fixed draw the sketch follows one coherent
-    trajectory down to `x_0`, which is what a constraint should look like.
+    `eps` is drawn once and reused for every step, and shared by every source.
+    Redrawing (what RePaint does, and what its resampling loop needs) makes the
+    constraint jitter between steps; with a fixed draw the sketch follows one
+    coherent trajectory down to `x_0`, which is what a constraint should look
+    like. Sharing it across sources buys two things: a cell covered by both
+    sees the same noise either way, so one source releasing is a change of
+    target and not also a change of noise — and the RNG stream does not depend
+    on how many sources are on, so seeds stay comparable across runs.
+
+    Two stages, deliberately separated. First the sources are combined into one
+    target — a convex combination, each source's per-cell share being its
+    weight normalized against the weights of the other sources covering that
+    cell. Then the latent is lerped toward that target by the strength, over
+    every cell any source covers:
+
+        target = sum_i (w_i * mask_i / sum_j w_j * mask_j) * known_i
+        x     <- x + strength * covered * (target - x)
+
+    So the weights say only how the sources divide the constrained cells
+    between themselves, and the strength alone says how much of the prior
+    survives there — 1.0 is a full overwrite of every covered cell whatever the
+    weights are. Folding the weights into the mix against `x` instead (the
+    obvious thing) entangles the two: two sources at 0.5 would leave the prior
+    a quarter share at full strength, which is not what a strength knob means.
+
+    The normalization is recomputed per live set, so a source releasing hands
+    its share to the ones still applying rather than leaking it to the prior.
+    The corollary is that a source's weight does nothing when it is the only
+    one covering a cell — it is a ratio, and there is nothing to take a ratio
+    against. That is the strength's job.
 
     Nothing here is a patched sampler in the checkout: `sample_once` is
     swapped on the instance for the duration and put back after, the same
@@ -286,38 +358,95 @@ def inject_sketch_constraint(sampler, sketch, config, log):
     """
     import torch
 
-    if sketch is None:
-        yield
+    # One entry per sampler step: which sources were applied on it. Recorded
+    # rather than recomputed because this closure is the only place that knows
+    # `t_prev`; the capture reads it afterwards to draw the signal the way the
+    # run actually saw it. Appending changes nothing about the sampling — it
+    # draws nothing and touches no tensor.
+    applied: list[tuple[str, ...]] = []
+
+    if not constraints:
+        yield applied
         return
 
-    latent, mask = sketch
-    weight = float(config.get("sketch_weight", 1.0))
-    release = float(config.get("sketch_release", 0.0))
     sigma_min = sampler.sigma_min
-    blend = (weight * mask).to(latent.dtype)
-    eps = torch.randn_like(latent)
-    log(f"sketch constraint: weight {weight:g}, "
-        f"{'held to t=0' if release <= 0 else f'released below t={release:g}'}")
-    if str(config.get("sketch_mask")) == "none" and weight > 0.75:
-        log("warning: unmasked mixing at this weight replaces the whole "
-            "object with the wireframe — 0.5 is the plain average")
+    strength = float(config.get("constraint_strength", 1.0))
+    eps = torch.randn_like(constraints[0]["latent"])
+    prepared = [
+        (
+            entry["name"],
+            entry["latent"],
+            (entry["weight"] * entry["mask"]).to(entry["latent"].dtype),
+            entry["release"],
+        )
+        for entry in constraints
+    ]
+    log(f"structure constraint: strength {strength:g} over " + ", ".join(
+        f"{name} (share {entry['weight']:g}"
+        + ("" if release <= 0 else f", until t={release:g}") + ")"
+        for entry, (name, _, _, release) in zip(constraints, prepared)
+    ))
+
+    if str(config.get("sketch_mask")) == "none" and strength > 0.75:
+        log("warning: unmasked at this strength replaces the whole object "
+            "with the constraint — the mask covers every cell, so nothing of "
+            "the prior survives")
+
+    # Per live set of sources: `(latent, share)` for each one and the cells any
+    # of them cover. `share` is that source's weight over the summed weights of
+    # everything live covering the cell, so the shares add to 1 wherever
+    # anything is constrained — which is what makes the signal below a weighted
+    # average of the sources and nothing more. Cached because the sets repeat:
+    # there are only as many as there are distinct release times.
+    splits: dict[tuple[str, ...], tuple[list, "torch.Tensor"]] = {}
+
+    def split(live):
+        if live not in splits:
+            entries = [entry for entry in prepared if entry[0] in live]
+            total = sum((entry[2] for entry in entries[1:]), entries[0][2])
+            covered = (total > 0).to(total.dtype)
+            splits[live] = (
+                # clamp only to keep the division finite; `covered` zeroes
+                # those cells out anyway
+                [(latent, cov / total.clamp_min(1e-12))
+                 for _, latent, cov, _ in entries],
+                covered,
+            )
+        return splits[live]
 
     original = sampler.sample_once
 
     def sample_once(model, x_t, t, t_prev, cond=None, **kwargs):
         out = original(model, x_t, t, t_prev, cond, **kwargs)
-        if t_prev >= release:
+        live = tuple(
+            name for name, _, _, release in prepared if t_prev >= release
+        )
+        applied.append(live)
+        if live and strength > 0:
             scale = sigma_min + (1 - sigma_min) * t_prev
             dtype = out.pred_x_prev.dtype
-            known = ((1 - t_prev) * latent + scale * eps).to(dtype)
-            out.pred_x_prev = out.pred_x_prev + blend.to(dtype) * (
-                known - out.pred_x_prev
-            )
+            sources, covered = split(live)
+
+            # The inpainting signal for this step. Each live source says where
+            # its own grid would be at t_prev; `share` splits the cells they
+            # both cover between them (sketch 1.0 against surface 0.25 -> four
+            # fifths sketch there) and is 1 where only one of them is present.
+            signal = torch.zeros_like(out.pred_x_prev)
+            for latent, share in sources:
+                known = ((1 - t_prev) * latent + scale * eps).to(dtype)
+                signal = signal + share.to(dtype) * known
+
+            # The only mix against the model's own prediction: lerp the
+            # previous latent toward that signal by the strength. `covered` is
+            # 0 outside the constraint region, pinning those cells to the
+            # previous latent.
+            mix = (strength * covered).to(dtype)
+            out.pred_x_prev = (1 - mix) * out.pred_x_prev + mix * signal
         return out
 
     sampler.sample_once = sample_once
     try:
-        yield
+        yield applied
     finally:
         # delete rather than reassign: `sample_once` lives on the class, and
         # putting the bound method back as an instance attribute would leave
@@ -325,8 +454,57 @@ def inject_sketch_constraint(sampler, sketch, config, log):
         del sampler.sample_once
 
 
+def capture_constraint_frames(config, applied, log):
+    """The constraint grids themselves, one frame per structure step.
+
+    No single grid moves while it is on — each is fixed before sampling starts
+    and every step mixes the same one in, noised to that step's time — so a
+    frame changes only when a source is released. With one source that is the
+    same volume repeated and then empty; with two released at different times
+    it is the sketch outliving the surface, or the reverse. What the model is
+    told does not evolve, only when it stops being told, and this draws exactly
+    that. Sources are distinguishable by density (see `CONSTRAINT_DENSITY`),
+    the sketch drawn last so it wins where they overlap.
+
+    The 64^3 grids, not the 16^3 latents the mix actually happens in. The
+    latent is what the sampler sees, but it is an encoding of this, and this is
+    the thing a person can compare against the strokes on screen.
+    """
+    import numpy as np
+
+    if not applied:
+        return None
+    grids = {
+        name: np.load(config[name]).astype(np.uint8) > 0
+        for name in CONSTRAINT_SOURCES if config.get(name)
+    }
+    if not grids:
+        return None
+
+    shape = next(iter(grids.values())).shape
+    cache: dict[tuple[str, ...], bytes] = {}
+    frames = []
+    for live in applied:
+        key = tuple(name for name in CONSTRAINT_SOURCES if name in live)
+        if key not in cache:
+            volume = np.zeros(shape, dtype=np.uint8)
+            for name in key:
+                volume[grids[name]] = CONSTRAINT_DENSITY[name]
+            cache[key] = to_texture_bytes(volume)
+        frames.append(cache[key])
+
+    held = {
+        name: sum(1 for live in applied if name in live) for name in grids
+    }
+    log("constraint capture: " + ", ".join(
+        f"{name} applied on {count} of {len(applied)} step(s)"
+        for name, count in held.items()
+    ))
+    return frames
+
+
 def report_sketch_coverage(config, coords, log):
-    """How much of the sketch the finished occupancy grid actually contains.
+    """How much of each constraint the finished occupancy grid contains.
 
     The one number that says whether the constraint took. It is not the
     experiment's score — that is IoU against a known object, measured away
@@ -335,18 +513,21 @@ def report_sketch_coverage(config, coords, log):
     """
     import numpy as np
 
-    path = config.get("sketch")
-    if not path:
+    paths = [
+        (name, config[name]) for name in CONSTRAINT_SOURCES
+        if config.get(name)
+    ]
+    if not paths:
         return
-    grid = np.load(path)
     index = coords[:, 1:].long().cpu().numpy()
     occupied = np.zeros((GRID, GRID, GRID), dtype=bool)
     occupied[index[:, 0], index[:, 1], index[:, 2]] = True
-    wanted = grid.astype(bool)
-    hit = int((occupied & wanted).sum())
-    total = int(wanted.sum())
-    log(f"sketch coverage: {hit}/{total} stroke voxel(s) occupied "
-        f"({100 * hit / max(total, 1):.1f}%)")
+    for name, path in paths:
+        wanted = np.load(path).astype(bool)
+        hit = int((occupied & wanted).sum())
+        total = int(wanted.sum())
+        log(f"{name} coverage: {hit}/{total} constrained voxel(s) occupied "
+            f"({100 * hit / max(total, 1):.1f}%)")
 
 
 def run_pipeline(pipeline, images, config, capture, log):
@@ -410,7 +591,7 @@ def run_pipeline(pipeline, images, config, capture, log):
     # which is after the sampler's starting noise — so a constrained run and an
     # unconstrained one at the same seed begin from the same x_1 and differ
     # only by the constraint.
-    sketch = encode_sketch(config, pipeline.device, log)
+    constraints = encode_constraints(config, pipeline.device, log)
 
     progress("sparse_structure", 0.0, "sampling structure")
     flow_model = pipeline.models["sparse_structure_flow_model"]
@@ -425,7 +606,8 @@ def run_pipeline(pipeline, images, config, capture, log):
     }
     sampler = pipeline.sparse_structure_sampler
     with multi_image("sparse_structure_sampler", ss_params["steps"]), \
-            inject_sketch_constraint(sampler, sketch, config, log):
+            inject_sketch_constraint(
+                sampler, constraints, config, log) as applied:
         structure = sampler.sample(
             flow_model, noise, **cond, **ss_params, verbose=True
         )
@@ -473,6 +655,9 @@ def run_pipeline(pipeline, images, config, capture, log):
             "structure": capture_structure_frames(pipeline, structure, log),
             "latent": capture_slat_frames(latent, coords, log),
         }
+        constraint = capture_constraint_frames(config, applied, log)
+        if constraint:
+            frames["constraint"] = constraint
         progress("capture", 1.0, "captured")
 
     progress("decode", 0.0, "decoding mesh")
@@ -491,7 +676,12 @@ def write_frames(frames, directory):
     blob = directory / "frames.bin"
     manifest = {"grid": GRID, "stages": []}
     with open(blob, "wb") as handle:
-        for stage in ("structure", "latent"):
+        # "constraint" is optional and is not a stage of the flow: it runs
+        # alongside the structure steps rather than after them, and the client
+        # reads stages by name, so its place in the file carries no meaning.
+        for stage in ("structure", "latent", "constraint"):
+            if not frames.get(stage):
+                continue
             offset = handle.tell()
             for frame in frames[stage]:
                 handle.write(frame)
@@ -628,6 +818,14 @@ def main() -> None:
             "(check HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES)"
         )
     log(f"torch {torch.__version__} on {torch.cuda.get_device_name(0)}")
+    # What the card looks like before this process allocates anything. The
+    # first question an out-of-memory run raises is whether something else was
+    # still resident when the pipeline loaded — an experiment that surfaces
+    # the sketch first has another method's model on the card minutes earlier
+    # — and this is the line that answers it without guesswork.
+    free, total = torch.cuda.mem_get_info()
+    log(f"GPU memory before loading: {free / 2**30:.1f} GiB free of "
+        f"{total / 2**30:.1f} GiB")
 
     from trellis.pipelines import TrellisImageTo3DPipeline
 

@@ -23,6 +23,8 @@ of the strokes is the first thing to try, not the answer.
 
 import base64
 import json
+import re
+import shutil
 import subprocess
 import uuid
 from abc import ABC, abstractmethod
@@ -33,6 +35,7 @@ from typing import Any, Callable, Optional
 from .base import EmitFn, LogFn, ProgressFn, SurfacingAdapter
 from .common import (
     JOBS_DIR,
+    SERVER_DIR,
     backend_method,
     backend_name,
     group_strokes_by_part,
@@ -124,6 +127,52 @@ class Conditioner(ABC):
         """Write this unit's conditioning images into `work_dir` and return
         them in view order. Raise ValueError if this unit cannot be
         conditioned (the adapter skips it and carries on with the rest)."""
+
+
+# --- debug mirror ---------------------------------------------------------
+
+# The conditioning renders are the only thing the model actually sees of the
+# sketch, so when a run comes back wrong they are the first thing to look at —
+# but they live in a per-job scratch directory named after a uuid, which is
+# pruned, and on the AMD fork a crash in the pipeline is common enough that
+# "find the job dir of the run that died" was the slow part of every debug
+# loop. So they are also copied to one fixed path, written the moment each PNG
+# is decoded (before the worker is spawned at all, hence before anything can
+# fail), and holding exactly one run: the directory is emptied when a run
+# starts, so whatever is in there is always the latest attempt.
+#
+# AMD only, deliberately: this is a debugging aid for the fork, and on CUDA it
+# would be an unexplained directory appearing in the server tree.
+DEBUG_VIEWS_DIR = SERVER_DIR / "debug" / "latest"
+DEBUG_BACKEND = "rocm"
+
+
+def debug_views_dir(log: LogFn) -> Optional[Path]:
+    """Empty and return the debug mirror, or None if this run should not
+    write one. Never raises: a debugging aid must not be able to fail a run."""
+    if backend_name() != DEBUG_BACKEND:
+        return None
+    try:
+        shutil.rmtree(DEBUG_VIEWS_DIR, ignore_errors=True)
+        DEBUG_VIEWS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"warning: could not prepare {DEBUG_VIEWS_DIR}: {exc}")
+        return None
+    log(f"conditioning renders mirrored to {DEBUG_VIEWS_DIR}")
+    return DEBUG_VIEWS_DIR
+
+
+def _mirror_view(debug_dir: Optional[Path], unit: "Unit", name: str,
+                 data: bytes, log: LogFn) -> None:
+    if debug_dir is None:
+        return
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", unit.label).strip("_") or "unit"
+    try:
+        target = debug_dir / slug
+        target.mkdir(parents=True, exist_ok=True)
+        (target / name).write_bytes(data)
+    except OSError as exc:
+        log(f"warning: could not mirror {name} to {debug_dir}: {exc}")
 
 
 def _decode_image(value: str) -> bytes:
@@ -253,13 +302,19 @@ class ClientViewsConditioner(Conditioner):
         else:
             images = views
 
+        debug_dir = options.get("debug_dir")
         paths: list[Path] = []
         for index, value in enumerate(images):
-            path = work_dir / f"view_{index:02d}.png"
+            name = f"view_{index:02d}.png"
+            path = work_dir / name
             try:
-                path.write_bytes(_decode_image(value))
+                data = _decode_image(value)
             except Exception as exc:
                 raise ValueError(f"view {index} is not decodable: {exc}")
+            path.write_bytes(data)
+            # mirrored here rather than after the loop, so a later view that
+            # fails to decode still leaves the good ones to look at
+            _mirror_view(debug_dir, unit, name, data, log)
             paths.append(path)
         if not paths:
             raise ValueError("no views to condition on")
@@ -303,6 +358,17 @@ STROKE_SAMPLE_SPACING = 0.4
 # not to the very edge, since the model routinely adds volume the drawing never
 # had (a thicker back, a base) and that volume needs somewhere to go.
 CUBE_FILL = 0.9
+
+# Where the surfacing run that feeds the constraint starts from. The threshold
+# is NS2S's own default; the blur is what turns a shell full of pinholes into
+# one a level set can be taken of. The two interact — smoothing moves the
+# level set, and above 0.5 it moves inward — so they are one pair of knobs
+# rather than two independent ones.
+SURFACE_METHOD_THRESHOLD = 0.6
+SURFACE_METHOD_BLUR = 1.6
+# NS2S's default grid margin — the surface is allowed to bulge outside the
+# strokes, and this is the room it has to do it in.
+SURFACE_METHOD_MARGIN = 1.2
 
 
 def _voxelize_strokes(unit: "Unit", log: LogFn) -> tuple[Any, dict[str, Any]]:
@@ -384,6 +450,104 @@ def _voxelize_strokes(unit: "Unit", log: LogFn) -> tuple[Any, dict[str, Any]]:
         "translation": [float(v) for v in centre],
     }
     return grid, align
+
+
+def _surface_shell(field: Any, cut: int, log: LogFn) -> Any:
+    """The boundary of `field >= cut`, as indices into the field.
+
+    NS2S predicts *occupancy* — the solid, interior included — and TRELLIS's
+    stage-1 grid is a voxelization of a *surface*: about twenty thousand cells
+    for a typical object, all of them on the shell. Handing it a filled block
+    asks for something its stage-1 latents were never trained on, and the
+    voxel set that comes back is what stage 2 then allocates per cell, so a
+    solid constraint is also the expensive kind of wrong.
+
+    So the constraint is the shell: an occupied voxel keeping at least one of
+    its six face neighbours outside the threshold. Anything off the edge of
+    the grid counts as outside, which only matters if the prediction is
+    clipped by its own margin.
+    """
+    import numpy as np  # server env
+
+    solid = field >= cut
+    # a voxel is interior when all six neighbours are solid too; shifting the
+    # array is that test, with False shifted in at the faces
+    interior = solid.copy()
+    for axis in range(3):
+        for step in (1, -1):
+            shifted = np.roll(solid, step, axis=axis)
+            # roll wraps; the wrapped-in plane is outside the grid, so clear it
+            plane = [slice(None)] * 3
+            plane[axis] = 0 if step == 1 else -1
+            shifted[tuple(plane)] = False
+            interior &= shifted
+    shell = solid & ~interior
+    log(f"surface constraint: {int(solid.sum())} voxel(s) above the "
+        f"threshold, {int(shell.sum())} on the shell")
+    return np.argwhere(shell)
+
+
+def _voxelize_surface(
+    field: Any,
+    header: dict[str, Any],
+    align: dict[str, Any],
+    threshold: float,
+    log: LogFn,
+) -> Any:
+    """A predicted occupancy field as a 64^3 binary grid in TRELLIS's frame.
+
+    The field arrives in NS2S's own normalized cube and `header["align"]` says
+    where that cube sits in the world; `align` is the sketch normalization
+    `_voxelize_strokes` chose, which is the frame the constraint is written
+    in. So this is two changes of basis in a row — NS2S cube -> world ->
+    TRELLIS cube — with the same y-up to z-up flip the strokes get.
+
+    The *shell* of the prediction, not its interior — see `_surface_shell`.
+
+    Mapped forwards, voxel by voxel, rather than sampled backwards: the field
+    is 112^3 across roughly the same extent as a 64^3 cube, so every target
+    cell a surface passes through is hit by some source voxel and nothing
+    needs interpolating. It also makes the clipped count exact — the surface
+    is allowed to bulge outside the strokes, and `CUBE_FILL` only leaves it so
+    much room before the cube's wall cuts it off.
+    """
+    import numpy as np  # server env
+
+    cut = int(round(threshold * 255))
+    index = _surface_shell(field, cut, log)
+    if index.size == 0:
+        log("surface constraint: the prediction is empty at threshold "
+            f"{threshold:g} — nothing to add")
+        return np.zeros((OCCUPANCY_GRID,) * 3, dtype=np.uint8)
+
+    resolution = int(header.get("grid", field.shape[0]))
+    source = header["align"]
+    # voxel centre -> the method's unit cube -> world
+    cube = (index + 0.5) / resolution - 0.5
+    world = cube * float(source["scale"]) + np.asarray(
+        source["translation"], dtype=float
+    )
+
+    # world -> the sketch's unit cube -> TRELLIS's z-up frame -> voxel coords
+    unit = (world - np.asarray(align["translation"], dtype=float)) / float(
+        align["scale"]
+    )
+    trellis = np.column_stack([unit[:, 0], -unit[:, 2], unit[:, 1]])
+    voxel = np.floor((trellis + 0.5) * OCCUPANCY_GRID).astype(int)
+
+    inside = np.all((voxel >= 0) & (voxel < OCCUPANCY_GRID), axis=1)
+    clipped = int((~inside).sum())
+    voxel = voxel[inside]
+
+    grid = np.zeros((OCCUPANCY_GRID,) * 3, dtype=np.uint8)
+    if len(voxel):
+        grid[voxel[:, 0], voxel[:, 1], voxel[:, 2]] = 1
+    occupied = int(grid.sum())
+    log(f"surface constraint: {len(index)} shell voxel(s) at p >= "
+        f"{threshold:g} -> {occupied} of {OCCUPANCY_GRID ** 3} "
+        f"cells ({100 * occupied / OCCUPANCY_GRID ** 3:.2f}%)"
+        + (f", {clipped} outside the cube" if clipped else ""))
+    return grid
 
 
 # --- fitting --------------------------------------------------------------
@@ -573,19 +737,125 @@ class TrellisAdapter(SurfacingAdapter):
             "the two combine.",
         },
         {
+            "name": "surface_inpaint",
+            "label": "Experiment: surface inpainting",
+            "type": "bool",
+            "default": False,
+            "help": "Add a predicted surface to the constraint grid. The "
+            "strokes are surfaced with NeuralSketch2Surf first (hardcoded for "
+            "now: probability field, threshold 0.6, blur 1.6 voxels), the "
+            "shell of that prediction is voxelized into the same 64^3 cube, "
+            "and the two grids are unioned — so the constraint carries a "
+            "closed surface rather than a wireframe the prior has to infer "
+            "one from. The shell, not the solid: stage 1 voxelizes surfaces, "
+            "and a filled grid is both outside what it was trained on and "
+            "several times the voxel count stage 2 then pays for. "
+            "The two grids stay separate all the way into the sampler, each "
+            "with its own weight and release below, and are mixed in turn — "
+            "surface first, strokes second, so the strokes win where they "
+            "overlap. With the sketch box off this runs on the surface "
+            "alone.",
+        },
+        {
+            "name": "surfaced_condition",
+            "label": "Experiment: surfaced image condition",
+            "type": "bool",
+            "default": False,
+            "help": "Condition on renders of a predicted surface instead of "
+            "renders of the strokes. The client surfaces the sketch with "
+            "NeuralSketch2Surf first and renders that solid, opaque and shaded "
+            "like any other geometry, from the same camera ring the stroke "
+            "views use. This is the other half of the wireframe problem: the "
+            "image branch reconstructs what it is shown, and what it has been "
+            "shown so far is line art. Costs one ns2s solve before the run "
+            "starts — shared with surface inpainting when that is also on, "
+            "not paid twice. Whole-object only: a part-based run keeps the "
+            "stroke renders.",
+        },
+        {
+            "name": "surface_smooth",
+            "label": "Experiment: smooth the surfaced condition",
+            "type": "bool",
+            "default": False,
+            "help": "Run NeuralSketch2Surf's own post-process on the surface "
+            "before it is rendered: Laplacian smoothing balanced against the "
+            "sketch curves, hole filling, normal repair, Taubin smoothing, at "
+            "the method's default balance. Marching cubes on a 112³ field "
+            "leaves stair-stepping that has nothing to do with the shape, and "
+            "the image branch has no way to know that. Only affects the "
+            "renders — the inpainting constraint is built from the field, "
+            "which no mesh post-process touches.",
+            "enabledWhen": {"param": "surfaced_condition", "equals": True},
+        },
+        {
+            "name": "surface_threshold",
+            "label": "Experiment: surface threshold",
+            "type": "float",
+            "default": SURFACE_METHOD_THRESHOLD,
+            "min": 0.05,
+            "max": 0.95,
+            "step": 0.05,
+            "help": "Probability the predicted surface is read at — the level "
+            "its shell is taken at for the constraint, and the level marching "
+            "cubes runs at for the surfaced image condition, so both boxes "
+            "read it. Lower keeps more of what the "
+            "surfacer was unsure about — thin features especially, which the "
+            "blur below pushes down. Note that the two are coupled: smoothing "
+            "moves the level set, and anything above 0.5 moves it inward, so "
+            "a heavy blur at a high threshold shrinks the surface and can "
+            "delete thin parts of it outright (a 2-voxel sheet peaks around "
+            "0.46 after a 1.6-voxel blur, and vanishes at 0.6).",
+        },
+        {
+            "name": "surface_blur",
+            "label": "Experiment: surface blur",
+            "type": "float",
+            "default": SURFACE_METHOD_BLUR,
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.1,
+            "help": "Gaussian smoothing of the probability field, in voxels, "
+            "applied on the server before anything is thresholded — so it "
+            "moves the constraint's shell and the rendered surface alike. 0 uses the "
+            "prediction as it comes: sharper, and pitted where the network "
+            "was uncertain, which a shell then traces every hole of.",
+        },
+        {
             "name": "sketch_mask",
-            "label": "Experiment: sketch constraint region",
+            "label": "Experiment: constraint region",
             "type": "choice",
             "default": "touched",
             "choices": ["touched", "dilated", "none"],
-            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
-            "help": "Which latent cells the constraint is written into. "
-            "'touched' is the cells whose 4^3 voxel block a stroke passes "
-            "through. 'dilated' grows that by one cell in each direction, a "
-            "cushion so the prior meets the constraint across a soft edge "
-            "rather than a hard step. 'none' is unmasked — the mix is applied "
-            "to the whole grid, which is the version that does not pretend "
-            "the 4x downsampling leaves a clean per-cell fact to overwrite.",
+            "help": "Which latent cells the constraint is written into, for "
+            "every source. KNOWN NOT TO WORK: 'touched' — the cells whose 4^3 "
+            "voxel block the grid sets. The sparse-structure VAE is a conv "
+            "stack with a receptive field far wider than one cell, so a latent "
+            "cell is not a local fact about its own block: its value was "
+            "computed from a whole neighbourhood, most of which is empty in a "
+            "sketch. Writing only the touched cells therefore pastes in values "
+            "that encode 'strokes here and nothing around them' while leaving "
+            "the neighbours the decoder reads them with untouched, and the two "
+            "disagree. 'dilated' grows the region by one cell in each "
+            "direction, which softens the seam but does not fix the cause. "
+            "'none' is unmasked — the mix is applied to the whole grid, which "
+            "is the version that does not pretend the 4x downsampling leaves a "
+            "clean per-cell fact to overwrite, and is the one to use.",
+        },
+        {
+            "name": "constraint_strength",
+            "label": "Experiment: inpainting strength",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "help": "How much of the prior survives in a constrained cell. The "
+            "mix is a lerp — the cell becomes (1-s)*current + s*constraint — "
+            "and this is the s, the only thing that trades the constraint "
+            "against the model. It does not depend on what is in the grid or "
+            "on the weights below: 1.0 is a full overwrite of every covered "
+            "cell however the sources divide it, and 0 disables inpainting "
+            "entirely without changing anything else about the run.",
         },
         {
             "name": "sketch_weight",
@@ -596,28 +866,66 @@ class TrellisAdapter(SurfacingAdapter):
             "max": 1.0,
             "step": 0.05,
             "enabledWhen": {"param": "sketch_inpaint", "equals": True},
-            "help": "Lerp weight toward the noised sketch latent: the cell "
-            "becomes (1-w)*current + w*sketch. It means different things either "
-            "side of the mask switch. Masked, 1.0 is a plain overwrite of the "
-            "stroke cells and is the natural setting. Unmasked, 0.5 is the "
-            "plain average of the two grids and is the natural setting — 1.0 "
-            "there replaces the whole object with the wireframe and is not a "
-            "useful run.",
+            "help": "The strokes' share of a cell that both sources cover, "
+            "against the surface's weight below — the two are normalized, so "
+            "only their ratio matters. It does nothing where the strokes are "
+            "the only source there, and nothing at all with surface "
+            "inpainting off: how hard the constraint is applied is the "
+            "strength above, not this.",
+        },
+        {
+            "name": "surface_weight",
+            "label": "Experiment: surface constraint weight",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "surface_inpaint", "equals": True},
+            "help": "The surface's share where it overlaps the strokes, "
+            "against the sketch weight above. Equal weights average the two "
+            "targets; 0.25 against 1.0 gives the surface a fifth of the "
+            "overlap and the strokes the rest, which is the sensible "
+            "direction — the strokes are what the user drew, this is a guess "
+            "about everything between them. Outside the overlap the surface "
+            "gets the cell to itself whatever this says. If one source "
+            "releases, its share goes to the ones still applying, not back to "
+            "the prior.",
         },
         {
             "name": "sketch_release",
-            "label": "Experiment: release constraint below t",
+            "label": "Experiment: release sketch below t",
             "type": "float",
             "default": 0.0,
             "min": 0.0,
             "max": 1.0,
             "step": 0.05,
             "enabledWhen": {"param": "sketch_inpaint", "equals": True},
-            "help": "Stop applying the constraint once the flow time drops "
-            "below this, leaving the last steps free to reconcile the "
-            "constrained cells with their neighbours. 0 constrains all the way "
-            "to t=0, which makes the final latent hold the sketch exactly "
-            "wherever the mix was full.",
+            "help": "Stop applying the stroke constraint once the flow time "
+            "drops below this, leaving the last steps free to reconcile the "
+            "constrained cells with their neighbours. Time runs 1 -> 0, so "
+            "this frees the END of sampling; 0 constrains all the way down, "
+            "which makes the final latent hold the sketch exactly wherever the "
+            "mix was full. Note the sampler's rescale_t=3.0 bunches steps up "
+            "at high t, so a value frees fewer steps than it looks: at 12 "
+            "steps, 0.5 leaves only the last 3 free and 1.0 disables the "
+            "constraint outright.",
+        },
+        {
+            "name": "surface_release",
+            "label": "Experiment: release surface below t",
+            "type": "float",
+            "default": 0.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "surface_inpaint", "equals": True},
+            "help": "The same, for the predicted surface. Releasing it earlier "
+            "than the strokes is the interesting run: the surface says what "
+            "shape to head toward while the topology is still being decided, "
+            "then gets out of the way and lets the prior and the strokes "
+            "finish the geometry. The flow view's inpainting signal region "
+            "shows exactly when each source drops out.",
         },
         {
             "name": "seed",
@@ -895,9 +1203,26 @@ class TrellisAdapter(SurfacingAdapter):
             "preprocess": bool(options.pop("preprocess", True)),
             "no_image_cond": bool(options.pop("no_image_cond", False)),
             "sketch_inpaint": bool(options.pop("sketch_inpaint", False)),
+            "surface_inpaint": bool(options.pop("surface_inpaint", False)),
+            # Acted on by the client, which has to surface and render before
+            # it can submit at all; recorded here so the run's config says
+            # what its conditioning images actually were.
+            "surfaced_condition": bool(options.pop("surfaced_condition", False)),
+            "surface_smooth": bool(options.pop("surface_smooth", False)),
+            "surface_threshold": float(
+                options.pop("surface_threshold", SURFACE_METHOD_THRESHOLD)
+            ),
+            "surface_blur": float(
+                options.pop("surface_blur", SURFACE_METHOD_BLUR)
+            ),
             "sketch_mask": str(options.pop("sketch_mask", "touched")),
+            "constraint_strength": float(
+                options.pop("constraint_strength", 1.0)
+            ),
             "sketch_weight": float(options.pop("sketch_weight", 1.0)),
+            "surface_weight": float(options.pop("surface_weight", 1.0)),
             "sketch_release": float(options.pop("sketch_release", 0.0)),
+            "surface_release": float(options.pop("surface_release", 0.0)),
             "interactive": interactive,
             "keep_raw": bool(options.pop("keep_raw", False)),
             "simplify_ratio": float(options.pop("simplify_ratio", 0.9)),
@@ -912,12 +1237,24 @@ class TrellisAdapter(SurfacingAdapter):
 
         units = self._units(sketch, part_based, log)
 
-        # this method owns the card for the length of the run: the pipeline is
-        # ~4GB of weights and the flow transformers peak well above that
-        release_other_workers(self.name, log)
         prune_job_dirs()
         job_dir = JOBS_DIR / f"trellis-{uuid.uuid4().hex[:8]}"
         job_dir.mkdir(parents=True)
+
+        # Before the card is claimed, not after: surfacing runs on the GPU
+        # too, and its worker sits on ~13GB that the release below is there to
+        # reclaim. Every unit is predicted in one call so the model loads once.
+        surfaces: list[Optional[tuple[Any, dict[str, Any]]]] = [None] * len(units)
+        if config["surface_inpaint"]:
+            report(0.005, "predicting the surface for the constraint")
+            surfaces = self._surface_grids(
+                units, job_dir, config["surface_blur"], log
+            )
+
+        # this method owns the card for the length of the run: the pipeline is
+        # ~4GB of weights and the flow transformers peak well above that
+        release_other_workers(self.name, log)
+        debug_dir = debug_views_dir(log)
 
         meshes: list[Any] = []
         span = 0.98 / len(units)
@@ -930,13 +1267,14 @@ class TrellisAdapter(SurfacingAdapter):
             try:
                 images = conditioner.prepare(
                     unit,
-                    {**conditioner_options, "views": views},
+                    {**conditioner_options, "views": views,
+                     "debug_dir": debug_dir},
                     unit_dir,
                     log,
                 )
                 result = self._run_one(
                     unit, images, config, fit, min_component, unit_dir, repo,
-                    python, defines, log,
+                    python, defines, surfaces[index], log,
                     lambda frac, msg, base=base: report(base + span * frac, msg),
                 )
             except ValueError as exc:
@@ -980,6 +1318,78 @@ class TrellisAdapter(SurfacingAdapter):
             for part_id, strokes in groups.items()
         ]
 
+    @staticmethod
+    def _surface_grids(
+        units: list[Unit], job_dir: Path, blur: float, log: LogFn
+    ) -> list[Optional[tuple[Any, dict[str, Any]]]]:
+        """Predicted occupancy fields, one slot per unit, None where there is
+        none.
+
+        The surfacing method is another adapter, called as a component: it
+        owns how its own network is run and what frame its output is in, and
+        this only needs the field and the way back to world. A failure here is
+        not fatal — the run falls back to whatever the strokes give, which is
+        the experiment's own control condition.
+
+        Positional, not keyed by label: two parts may carry the same name, and
+        a dict would quietly hand one part's surface to another.
+
+        Both sides of the card are handled here. Surfacing is a GPU job too,
+        so it evicts the other methods before it loads — the same rule every
+        GPU method follows, and skipping it would mean loading ~13GB on top of
+        whatever was already resident. Then its own worker is stopped as soon
+        as the grids are in hand, rather than left for the general sweep: the
+        process holds its model until it is reaped, and the pipeline that
+        loads next needs the whole card.
+        """
+        from . import ns2s
+
+        keys = [f"{index}: {unit.label}" for index, unit in enumerate(units)]
+        # Set only if the method actually has to predict something. With the
+        # surfaced image condition on, the client's own ns2s job has already
+        # made these fields and they come back from its cache, in which case
+        # nothing is loaded and there is nothing to release either.
+        predicted = False
+
+        def before_predict() -> None:
+            nonlocal predicted
+            predicted = True
+            release_other_workers(ns2s.METHOD_NAME, log)
+
+        try:
+            grids = ns2s.probability_grids(
+                {
+                    key: {"strokes": unit.strokes}
+                    for key, unit in zip(keys, units)
+                },
+                job_dir,
+                SURFACE_METHOD_MARGIN,
+                blur,
+                log,
+                before_predict,
+            )
+        except Exception as exc:
+            log(f"surface inpainting: prediction failed ({type(exc).__name__}: "
+                f"{exc}); continuing without a surface")
+            return [None] * len(units)
+        finally:
+            # Logged either way: "was the surfacing model still resident when
+            # TRELLIS started" is the first question an out-of-memory run
+            # raises, and a silent success answers it as poorly as a silent
+            # failure.
+            if not predicted:
+                log("surface inpainting: reused an existing prediction, so "
+                    "nothing was loaded onto the card")
+            try:
+                stopped = ns2s.WORKER.stop()
+                log("released the ns2s worker after the prediction"
+                    if stopped else
+                    "ns2s worker was already gone after the prediction")
+            except Exception as exc:
+                log(f"WARNING: could not release the ns2s worker ({exc}) — it "
+                    "is still holding the GPU and TRELLIS may run out of memory")
+        return [grids.get(key) for key in keys]
+
     def _run_one(
         self,
         unit: Unit,
@@ -991,6 +1401,7 @@ class TrellisAdapter(SurfacingAdapter):
         repo: Path,
         python: Path,
         defines: dict[str, str],
+        surface: Optional[tuple[Any, dict[str, Any]]],
         log: LogFn,
         on_progress: Callable[[float, str], None],
     ) -> "UnitResult":
@@ -1008,11 +1419,51 @@ class TrellisAdapter(SurfacingAdapter):
         # it is exact, and a 72-candidate ICP against a shape the strokes
         # already pin can only move it off.
         sketch_align: Optional[dict[str, Any]] = None
-        if config.get("sketch_inpaint"):
-            grid, sketch_align = _voxelize_strokes(unit, log)
-            sketch_path = unit_dir / "sketch.npy"
-            np.save(sketch_path, grid)
-            extra["sketch"] = str(sketch_path)
+        if config.get("sketch_inpaint") or config.get("surface_inpaint"):
+            # The strokes are voxelized either way: they define the cube the
+            # constraint is written in (and so the frame the result is read
+            # in), whether or not they end up in the grid themselves.
+            strokes, sketch_align = _voxelize_strokes(unit, log)
+            # One file per source rather than a union: the worker mixes each at
+            # its own weight and releases each at its own time, which a single
+            # grid cannot express. Sharing a cube is what makes them
+            # composable — both are written in the frame the strokes define.
+            grids: dict[str, Any] = {}
+            if config.get("sketch_inpaint"):
+                grids["sketch"] = strokes
+            if config.get("surface_inpaint"):
+                if surface is None:
+                    log(f"'{unit.label}': no predicted surface for this unit; "
+                        "constraining with "
+                        + ("the strokes alone" if config.get("sketch_inpaint")
+                           else "nothing"))
+                else:
+                    field, header = surface
+                    grids["surface"] = _voxelize_surface(
+                        field, header, sketch_align,
+                        float(config.get(
+                            "surface_threshold", SURFACE_METHOD_THRESHOLD
+                        )),
+                        log,
+                    )
+            for name in list(grids):
+                if int(grids[name].sum()) == 0:
+                    log(f"'{unit.label}': the {name} constraint came out "
+                        "empty — dropping it")
+                    del grids[name]
+            if not grids:
+                raise ValueError(
+                    "the constraint grid came out empty — nothing to inpaint "
+                    "with"
+                )
+            log(f"'{unit.label}': constraining with " + ", ".join(
+                f"{name} ({int(grid.sum())} of {OCCUPANCY_GRID ** 3} cells)"
+                for name, grid in grids.items()
+            ))
+            for name, grid in grids.items():
+                path = unit_dir / f"{name}.npy"
+                np.save(path, grid)
+                extra[name] = str(path)
 
         config_path = unit_dir / "config.json"
         config_path.write_text(json.dumps({

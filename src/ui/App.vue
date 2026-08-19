@@ -273,6 +273,20 @@
     @close="clearSurface"
   />
 
+  <OccupancyControls
+    v-if="occupancyActive"
+    :count="occupancyCount"
+    :grid="occupancyGrid"
+    :max="occupancyMax"
+    :threshold="occupancyThreshold"
+    :density="occupancyDensity"
+    :blur="occupancyBlur"
+    @set-threshold="occupancyThreshold = $event; applyOccupancyStyle()"
+    @set-density="occupancyDensity = $event; applyOccupancyStyle()"
+    @set-blur="occupancyBlur = $event; applyOccupancyBlur()"
+    @close="clearSurface"
+  />
+
   <BenchmarkWindow
     v-if="benchmarkOpen"
     @close="benchmarkOpen = false"
@@ -356,10 +370,22 @@ import {
   type MethodInfo,
   type MethodOptions,
 } from "../surfacing/client";
-import { renderConditioningViews } from "../engine/strokeViews";
+import {
+  renderConditioningViews,
+  renderSurfacedViews,
+} from "../engine/strokeViews";
 import { TrellisInteractiveView } from "../engine/TrellisInteractive";
 import { decodeFlowFrames, type FlowFrames } from "../surfacing/trellisFrames";
 import FlowTimeline from "./trellis-interactive/FlowTimeline.vue";
+import {
+  DEFAULT_OCCUPANCY_THRESHOLD,
+  OccupancyFieldView,
+} from "../engine/OccupancyField";
+import {
+  decodeOccupancyVolume,
+  type OccupancyVolume,
+} from "../surfacing/ns2sVolume";
+import OccupancyControls from "./occupancy-field/OccupancyControls.vue";
 import type { JointDofName, SurfaceShape } from "../core/types";
 import { jointPosed } from "../core/types";
 
@@ -461,6 +487,21 @@ const flowHasRaw = ref(false);
 const flowShowSketchOverlay = ref(false);
 const flowCanOverlaySketch = ref(false);
 const flowViewCount = ref(0);
+
+// --- raymarched occupancy field (NS2S probability volume) ---
+//
+// The lighter sibling of the flow view: one field, sitting over the sketch it
+// was predicted from, with the document left exactly as it is. Same lifetime
+// though — never serialized, never written, dropped by anything that clears a
+// surface.
+let occupancyView: OccupancyFieldView | undefined;
+const occupancyActive = ref(false);
+const occupancyCount = ref(0);
+const occupancyGrid = ref(0);
+const occupancyMax = ref(0);
+const occupancyThreshold = ref(DEFAULT_OCCUPANCY_THRESHOLD);
+const occupancyDensity = ref(1);
+const occupancyBlur = ref(0);
 /** The shown surface's glb + producing method, kept for embedding in saves. */
 let surfaceGlb: { method: string; bytes: ArrayBuffer } | null = null;
 /** The same result before postprocessing, when the run kept it. Only ever in
@@ -567,6 +608,7 @@ onUnmounted(() => {
   jointLines?.dispose();
   surface?.dispose();
   flowView?.dispose();
+  occupancyView?.dispose();
   strokeRenderer?.dispose();
   viewport?.dispose();
 });
@@ -842,12 +884,63 @@ async function runSurfacing(): Promise<void> {
       ? viewSpecFor(info, surfacingOptions.value[method] ?? {})
       : null;
     if (spec) {
-      surfacingLog.value = [...surfacingLog.value, "rendering sketch views…"];
-      options.views = await renderConditioningViews(
-        sketch,
-        spec,
-        Boolean(options.part_based),
-      );
+      // The surfaced condition shows the model a solid instead of line art,
+      // which means a surface has to exist before this job is submitted — the
+      // job protocol is one-way, so an adapter cannot hand the client geometry
+      // mid-run and wait for renders of it. Hence a separate ns2s job first.
+      // The field it predicts is kept server-side, so a run that also inpaints
+      // with the surface reuses this same prediction instead of paying for a
+      // second one.
+      const surfaced = Boolean(options.surfaced_condition);
+      if (surfaced && options.part_based) {
+        surfacingLog.value = [
+          ...surfacingLog.value,
+          "surfaced image condition is whole-object only; conditioning on " +
+            "stroke renders for this part-based run",
+        ];
+      }
+      if (surfaced && !options.part_based) {
+        surfacingLog.value = [
+          ...surfacingLog.value,
+          "surfacing the sketch for the image condition…",
+        ];
+        const surface = await runSurfacingJob({
+          method: "ns2s",
+          sketch,
+          options: {
+            part_based: false,
+            probability_volume: false,
+            // keep the field this mesh came from, for the TRELLIS job
+            with_volume: true,
+            threshold: Number(options.surface_threshold ?? 0.6),
+            blur: Number(options.surface_blur ?? 1.6),
+            // must match SURFACE_METHOD_MARGIN in adapters/trellis.py, or the
+            // inpainting path predicts its own field rather than reusing this
+            // one — a slower run, not a wrong one
+            margin: 1.2,
+            smooth: Boolean(options.surface_smooth),
+          },
+          onProgress: (status) =>
+            (surfacingProgress.value = 0.25 * status.progress),
+          onLog: (lines) => {
+            surfacingLog.value = [...surfacingLog.value, ...lines].slice(
+              -SURFACING_LOG_CAP,
+            );
+          },
+        });
+        surfacingLog.value = [
+          ...surfacingLog.value,
+          "rendering surfaced views…",
+        ];
+        options.views = await renderSurfacedViews(sketch, surface, spec);
+      } else {
+        surfacingLog.value = [...surfacingLog.value, "rendering sketch views…"];
+        options.views = await renderConditioningViews(
+          sketch,
+          spec,
+          Boolean(options.part_based),
+        );
+      }
     }
 
     // Artifacts a TRELLIS run was asked to keep. They arrive on the partial
@@ -855,6 +948,9 @@ async function runSurfacing(): Promise<void> {
     // finished — the whole capture is post-hoc by design.
     let flowFrames: FlowFrames | null = null;
     let rawGlb: ArrayBuffer | null = null;
+    // NS2S in probability-volume mode publishes one field per unit and no
+    // mesh at all, so these arrive instead of geometry rather than beside it
+    const occupancyFields: OccupancyVolume[] = [];
 
     const glb = await runSurfacingJob({
       method,
@@ -881,6 +977,17 @@ async function runSurfacing(): Promise<void> {
       onArtifact: (_name, kind, data) => {
         if (kind === "raw") {
           rawGlb = data;
+        } else if (kind === "ns2s-volume") {
+          try {
+            occupancyFields.push(decodeOccupancyVolume(data));
+          } catch (error) {
+            surfacingLog.value = [
+              ...surfacingLog.value,
+              `probability volume unusable: ${
+                error instanceof Error ? error.message : error
+              }`,
+            ];
+          }
         } else if (kind === "trellis-frames") {
           try {
             flowFrames = decodeFlowFrames(data);
@@ -919,6 +1026,8 @@ async function runSurfacing(): Promise<void> {
     // its own is a question about one object, not about a process, so it
     // stays in the ordinary overlay and the toggle just swaps which mesh is
     // in it — no reason to hide the document for that.
+    if (occupancyFields.length > 0) showOccupancyFields(occupancyFields);
+
     if (flowFrames) {
       await enterFlowView({
         sketch,
@@ -937,12 +1046,60 @@ async function runSurfacing(): Promise<void> {
 
 function clearSurface(): void {
   exitFlowView();
+  clearOccupancyFields();
   surfacePreview?.clear();
   surfaceGlb = null;
   surfaceRawGlb = null;
   flowHasRaw.value = false;
   flowShowRaw.value = false;
   hasSurface.value = false;
+}
+
+/** Put a run's occupancy fields up over the sketch.
+ *
+ *  Nothing is hidden and no tool is switched off: the field is an overlay on
+ *  the document, not a mode, and the run it came from delivered no mesh to
+ *  compete with it. */
+function showOccupancyFields(fields: OccupancyVolume[]): void {
+  if (!viewport) return;
+  occupancyView ??= new OccupancyFieldView(viewport);
+  occupancyView.show(fields);
+  occupancyActive.value = occupancyView.isActive;
+  occupancyCount.value = occupancyView.count;
+  occupancyGrid.value = fields[0]?.grid ?? 0;
+  occupancyMax.value = Math.max(...fields.map((field) => field.max), 0);
+  occupancyThreshold.value = DEFAULT_OCCUPANCY_THRESHOLD;
+  occupancyDensity.value = 1;
+  occupancyBlur.value = 0;
+  applyOccupancyStyle();
+  applyOccupancyBlur();
+  if (!occupancyActive.value) {
+    surfacingLog.value = [
+      ...surfacingLog.value,
+      "probability volume has no alignment — nothing says where it sits " +
+        "against the sketch, so it is not drawn",
+    ];
+  }
+}
+
+function clearOccupancyFields(): void {
+  if (!occupancyActive.value && !occupancyView?.isActive) return;
+  occupancyView?.clear();
+  occupancyActive.value = false;
+  occupancyCount.value = 0;
+}
+
+/** Re-blur the grid. Separate from the style because it rewrites the texture
+ *  rather than a uniform — see `OccupancyFieldView.setBlur`. */
+function applyOccupancyBlur(): void {
+  occupancyView?.setBlur(occupancyBlur.value);
+}
+
+function applyOccupancyStyle(): void {
+  occupancyView?.setStyle({
+    threshold: occupancyThreshold.value,
+    density: occupancyDensity.value,
+  });
 }
 
 /** Hand the viewport over to the flow view for a captured run.

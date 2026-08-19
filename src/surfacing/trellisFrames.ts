@@ -11,8 +11,16 @@
 const MAGIC = "TRLZ";
 const SUPPORTED_VERSION = 1;
 
-/** What one voxel's byte means, per stage. */
+/** What one voxel's byte means, per stage. These two are the flow itself,
+ *  and they run in sequence — which is what makes one scrubber over both
+ *  meaningful. */
 export type FlowStage = "structure" | "latent";
+
+/** Everything a bundle can carry, including tracks that are not stages of the
+ *  flow. "constraint" is the inpainting signal as it stood at each structure
+ *  step: it runs *alongside* those steps rather than after them, so it has a
+ *  frame per structure step and adds nothing to the timeline. */
+export type FlowTrack = FlowStage | "constraint";
 
 /** The similarity that puts the generated unit cube onto the sketch:
  *  `world = scale * rotation * v + translation`, with `rotation` in
@@ -28,8 +36,8 @@ export interface FlowFrames {
   /** Edge of the cubic grid; 64 for every current TRELLIS checkpoint. */
   grid: number;
   align: FlowAlign | null;
-  /** Per stage, one u8 volume per sampling step, in step order. */
-  stages: Record<FlowStage, Uint8Array[]>;
+  /** Per track, one u8 volume per sampling step, in step order. */
+  stages: Record<FlowTrack, Uint8Array[]>;
 }
 
 /** Number of steps in each stage, in timeline order. */
@@ -89,10 +97,17 @@ export function decodeFlowFrames(buffer: ArrayBuffer): FlowFrames {
 
   const grid = header.grid ?? 64;
   const frameBytes = header.frameBytes ?? grid ** 3;
-  const stages: Record<FlowStage, Uint8Array[]> = { structure: [], latent: [] };
+  const stages: Record<FlowTrack, Uint8Array[]> = {
+    structure: [],
+    latent: [],
+    constraint: [],
+  };
+  const known = new Set<string>(Object.keys(stages));
 
   for (const stage of header.stages ?? []) {
-    if (stage.name !== "structure" && stage.name !== "latent") continue;
+    // an unknown track is a newer capture read by an older build: skip it and
+    // show the rest, rather than losing the whole view over one extra name
+    if (!known.has(stage.name)) continue;
     for (let step = 0; step < stage.steps; step++) {
       const start = payloadStart + stage.offset + step * frameBytes;
       const end = start + frameBytes;
@@ -104,7 +119,7 @@ export function decodeFlowFrames(buffer: ArrayBuffer): FlowFrames {
       }
       // a view, not a copy: the whole capture is already one buffer and the
       // frames are uploaded to the GPU one at a time
-      stages[stage.name].push(bytes.subarray(start, end));
+      stages[stage.name as FlowTrack].push(bytes.subarray(start, end));
     }
   }
 

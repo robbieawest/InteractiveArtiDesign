@@ -144,3 +144,82 @@ describe("locateFrame", () => {
     expect(locateFrame(frames, 5)).toBeNull();
   });
 });
+
+describe("the constraint track", () => {
+  /** A bundle carrying tracks by name, one byte value per frame. */
+  function tracks(
+    entries: { name: string; frames: number[] }[],
+    grid = 2,
+  ): ArrayBuffer {
+    const frameBytes = grid ** 3;
+    const stages: { name: string; offset: number; steps: number }[] = [];
+    const payload: number[] = [];
+    for (const entry of entries) {
+      stages.push({
+        name: entry.name,
+        offset: payload.length,
+        steps: entry.frames.length,
+      });
+      for (const value of entry.frames) {
+        for (let i = 0; i < frameBytes; i++) payload.push(value);
+      }
+    }
+    const headerBytes = new TextEncoder().encode(
+      JSON.stringify({ grid, frameBytes, align: null, stages }),
+    );
+    const bytes = new Uint8Array(12 + headerBytes.length + payload.length);
+    bytes.set(new TextEncoder().encode("TRLZ"), 0);
+    const view = new DataView(bytes.buffer);
+    view.setUint32(4, 1, true);
+    view.setUint32(8, headerBytes.length, true);
+    bytes.set(headerBytes, 12);
+    bytes.set(payload, 12 + headerBytes.length);
+    return bytes.buffer;
+  }
+
+  it("decodes alongside the flow without extending the timeline", () => {
+    const frames = decodeFlowFrames(
+      tracks([
+        { name: "structure", frames: [1, 2, 3] },
+        { name: "latent", frames: [4, 5] },
+        // released on the last step: the signal is gone while the flow runs on
+        { name: "constraint", frames: [255, 255, 0] },
+      ]),
+    );
+
+    expect(frames.stages.constraint.map((frame) => frame[0])).toEqual([
+      255, 255, 0,
+    ]);
+    // one frame per structure step, and none of them are timeline positions
+    expect(frames.stages.constraint.length).toBe(
+      frames.stages.structure.length,
+    );
+    expect(stageLengths(frames)).toEqual({
+      structure: 3,
+      latent: 2,
+      total: 5,
+    });
+    expect(locateFrame(frames, 4)).toMatchObject({ stage: "latent", step: 1 });
+    expect(locateFrame(frames, 5)).toBeNull();
+  });
+
+  it("is simply absent from a run that had no constraint", () => {
+    const frames = decodeFlowFrames(
+      tracks([{ name: "structure", frames: [1] }, { name: "latent", frames: [2] }]),
+    );
+    expect(frames.stages.constraint).toEqual([]);
+  });
+
+  it("skips a track this build does not know", () => {
+    const frames = decodeFlowFrames(
+      tracks([
+        { name: "structure", frames: [1] },
+        { name: "something-new", frames: [9] },
+        { name: "latent", frames: [2] },
+      ]),
+    );
+    expect(stageLengths(frames).total).toBe(2);
+    expect(frames.stages.structure[0][0]).toBe(1);
+    expect(frames.stages.latent[0][0]).toBe(2);
+  });
+});

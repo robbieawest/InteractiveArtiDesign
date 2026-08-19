@@ -34,14 +34,38 @@ python side; each real method runs in its own environment via subprocess.
 Adapters can also publish non-geometry artifacts on the same partial channel,
 tagged with a `kind` the client routes on. TRELLIS uses it for two opt-in
 extras: the mesh before postprocessing, and a capture of what its two flow
-stages did. The capture is one u8 occupancy volume per sampling step
-(`surfacing/trellisFrames.ts` decodes the container), rendered by
+stages did. The capture is one u8 occupancy volume per sampling step, plus an
+optional "constraint" track holding the inpainting signal as it stood at each
+structure step (a track, not a stage: it runs alongside those steps and adds
+nothing to the timeline). That signal can carry more than one source — the
+strokes and a predicted surface, separately weighted and separately released —
+which the track distinguishes by density rather than by adding tracks. `surfacing/trellisFrames.ts` decodes the container,
+and the volumes are rendered by
 `engine/VolumeGrid.ts` as a raymarched 3D texture and laid out into regions by
 `engine/TrellisInteractive.ts`, with `ui/trellis-interactive/` driving it. That
 view is modal — tools are off, the document's strokes are hidden and the
 regions hold copies — and everything it holds is in memory only: frames are
 never serialized into the document and never written to disk, so Clear ends
 the run for good.
+
+Conditioning images are always rendered by the client (`engine/strokeViews.ts`
+over `engine/sketchRender.ts`), because the job protocol is one-way: options go
+up at submit time and everything after is polling, so an adapter cannot ask for
+a render mid-run. That is why TRELLIS's surfaced image condition runs an ns2s
+job of its own first, renders the returned mesh, and only then submits — and
+why the field that mesh came from is cached server-side (`FIELD_CACHE` in
+`adapters/ns2s.py`, keyed by the .obj predicted from) so the TRELLIS job's
+inpainting path reuses one prediction instead of loading the model twice.
+
+NS2S uses the same channel for its probability volume: with that parameter on
+it skips marching cubes and publishes the raw occupancy field instead of a
+mesh (`surfacing/ns2sVolume.ts` decodes it). `engine/OccupancyField.ts` marches
+it through the same `VolumeGrid`, but in place over the live document rather
+than in regions — the method normalizes the sketch itself, so the bundle
+carries the exact way back and the field belongs where the strokes already
+are. `ui/occupancy-field/` moves the threshold marching cubes would have baked
+in, and a Gaussian blur over the grid itself (`engine/volumeBlur.ts`, recomputed
+from the delivered field so a drag cannot compound). Same lifetime rule as the flow capture: memory only, dropped on Clear.
 
 ## Rendering
 
