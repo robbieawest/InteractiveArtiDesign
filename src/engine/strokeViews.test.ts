@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type * as THREE from "three";
 import { orbitDirections } from "./strokeViews";
 
 /** Elevation above the horizon of a (not necessarily normalized) direction. */
@@ -55,5 +56,26 @@ describe("orbitDirections", () => {
   it("defaults to the old constant-pitch ring", () => {
     const bare = orbitDirections(4, 0.35);
     expect(bare).toEqual(orbitDirections(4, 0.35, "ring", 0.35));
+  });
+
+  // TRELLIS.2 conditions on ONE image, and yaw 0 is dead-on front — which
+  // shows no depth at all. The offset is what makes a single view a
+  // three-quarter view.
+  it("offsets the first view by yaw0", () => {
+    const [only] = orbitDirections(1, 0.55, "ring", 0.55, 0.7);
+    expect(yawOf(only)).toBeCloseTo(0.7, 6);
+    expect(pitchOf(only)).toBeCloseTo(0.55, 6);
+  });
+
+  // a full orbit is the same orbit wherever it starts, so an offset must not
+  // change which directions a multi-view method gets — only their order
+  it("rotates a whole ring without changing the set", () => {
+    const offset = orbitDirections(4, 0.35, "ring", 0.35, Math.PI / 2);
+    const plain = orbitDirections(4, 0.35);
+    // % 360 because a yaw that lands on zero can arrive as a hair under 2*PI
+    const round = (y: number) => Math.round((y * 180) / Math.PI) % 360;
+    const sorted = (v: THREE.Vector3[]) =>
+      v.map(yawOf).map(round).sort((a, b) => a - b);
+    expect(sorted(offset)).toEqual(sorted(plain));
   });
 });

@@ -173,7 +173,10 @@ def health() -> dict[str, Any]:
                 # the client only renders views when a method asks for them
                 "viewSpec": ADAPTERS[name].view_spec,
             }
-            for name in sorted(ADAPTERS)
+            # a method this machine cannot run at all is not offered —
+            # `trellis2` is CUDA-only, and no amount of installing fixes that
+            # on an AMD box
+            for name in sorted(ADAPTERS) if ADAPTERS[name].available()
         ],
     }
 

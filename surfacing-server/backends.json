@@ -109,6 +109,31 @@
           "ATTN_BACKEND": "xformers",
           "SPARSE_BACKEND": "spconv"
         }
+      },
+
+      "trellis2": {
+        "_comment": [
+          "TRELLIS.2 appears under `cuda` and nowhere else, and the absence",
+          "is the point: there is no AMD fork to point at the way TRELLIS 1",
+          "has TRELLIS-AMD. flash-attn, cumesh, o-voxel and flexgemm are all",
+          "CUDA, and a 4B model wants >=24GB besides. `Trellis2Adapter.",
+          "available()` reads exactly this — no entry, method not offered —",
+          "so an AMD machine never shows a knob it could not act on.",
+          "",
+          "The venv lives inside the checkout, like TRELLIS 1's and for the",
+          "same reason: upstream's setup.sh pins its own torch, which has no",
+          "business in the `.venv-*` environments beside the server.",
+          "",
+          "ATTN_BACKEND is flash_attn, TRELLIS.2's own default, spelled the",
+          "way its config.py matches it. A card without flash-attn support",
+          "wants `xformers` here instead."
+        ],
+        "repo": "methods/TRELLIS.2",
+        "python": "methods/TRELLIS.2/.venv/bin/python",
+        "env": {
+          "ATTN_BACKEND": "flash_attn",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+        }
       }
     }
   }

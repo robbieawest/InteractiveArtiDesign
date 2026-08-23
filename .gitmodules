@@ -19,3 +19,6 @@
 [submodule "surfacing-server/methods/TRELLIS-AMD"]
 	path = surfacing-server/methods/TRELLIS-AMD
 	url = https://github.com/robbieawest/TRELLIS-AMD
+[submodule "surfacing-server/methods/TRELLIS.2"]
+	path = surfacing-server/methods/TRELLIS.2
+	url = https://github.com/robbieawest/TRELLIS.2

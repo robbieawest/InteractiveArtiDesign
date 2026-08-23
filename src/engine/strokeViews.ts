@@ -25,6 +25,7 @@ const DEFAULTS: Required<Omit<ViewSpec, "overrides">> = {
   pitch: 0.35,
   layout: "ring",
   pitchMax: 1.2,
+  yaw: 0,
   strokeColor: "#dcdcdc",
   strokeThickness: 0.012,
   margin: 1.15,
@@ -75,18 +76,24 @@ function styleFor(spec: ViewSpec): SketchRenderStyle {
  *  down at the sketch. That matters for image-conditioned methods that take no
  *  camera poses: they reconcile views from image content alone, so two views
  *  that look alike are ambiguity rather than evidence, and elevation separates
- *  them far better than more yaws at the same height do. */
+ *  them far better than more yaws at the same height do.
+ *
+ *  `yaw0` offsets where the sequence starts. It is invisible to a full orbit —
+ *  a ring is the same ring wherever it begins — and exists for the single-view
+ *  case, where the one camera would otherwise be square to the sketch and show
+ *  no depth at all. */
 export function orbitDirections(
   count: number,
   pitch: number,
   layout: "ring" | "helix" = "ring",
   pitchMax: number = pitch,
+  yaw0: number = 0,
 ): THREE.Vector3[] {
   const top = Math.min(pitchMax, MAX_PITCH);
   const base = Math.min(pitch, MAX_PITCH);
   const directions: THREE.Vector3[] = [];
   for (let i = 0; i < count; i++) {
-    const yaw = (2 * Math.PI * i) / count;
+    const yaw = yaw0 + (2 * Math.PI * i) / count;
     // a one-view helix has nowhere to climb to, and dividing by count - 1
     // would be a division by zero
     const elevation =
@@ -109,12 +116,12 @@ export async function renderStrokeViews(
   sketch: SurfacingSketch,
   spec: ViewSpec = {},
 ): Promise<string[]> {
-  const { count, pitch, layout, pitchMax } = { ...DEFAULTS, ...spec };
+  const { count, pitch, layout, pitchMax, yaw } = { ...DEFAULTS, ...spec };
   return renderSketchViews(
     sketch,
     [],
     styleFor(spec),
-    orbitDirections(count, pitch, layout, pitchMax),
+    orbitDirections(count, pitch, layout, pitchMax, yaw),
   );
 }
 
@@ -136,7 +143,7 @@ export async function renderSurfacedViews(
   surface: ArrayBuffer,
   spec: ViewSpec = {},
 ): Promise<string[]> {
-  const { count, pitch, layout, pitchMax } = { ...DEFAULTS, ...spec };
+  const { count, pitch, layout, pitchMax, yaw } = { ...DEFAULTS, ...spec };
   return renderSketchViews(
     { ...sketch, strokes: [] },
     [surface],
@@ -150,7 +157,7 @@ export async function renderSurfacedViews(
       surfaceContourColor: SURFACED_CONTOUR,
       surfaceContourStrength: SURFACED_CONTOUR_STRENGTH,
     },
-    orbitDirections(count, pitch, layout, pitchMax),
+    orbitDirections(count, pitch, layout, pitchMax, yaw),
   );
 }
 

@@ -23,13 +23,14 @@ describing the grid, and no marching cubes runs. A mesh extracted at one
 threshold has already thrown the probabilities away, and they are the thing
 the client raymarches (and the thing an inpainting signal is made of).
 
-With "volume" and "mesh" both set it writes the grid *and* meshes it, from the
-same forward pass and the same blurred field — marching cubes at "threshold",
-largest component, normals repaired, exactly what `process_and_save` does after
-its own sigmoid. That combination exists because two consumers want the same
-prediction: TRELLIS conditions on renders of the mesh and constrains sampling
-with the field, and running the network twice for them is a minute of GPU and
-13GB of residency for an answer that is already in hand.
+With "volume" and "mesh" both set it writes the grid *and* meshes it from the
+same forward pass — marching cubes at "threshold", largest component, normals
+repaired, exactly what `process_and_save` does after its own sigmoid. That
+combination exists because two consumers want the same prediction: TRELLIS
+conditions on renders of the mesh and constrains sampling with the field, and
+running the network twice for them is a minute of GPU and 13GB of residency for
+an answer that is already in hand. "blur" applies to the written grid only —
+the mesh is marched on the raw probabilities.
 """
 
 import glob
@@ -78,20 +79,14 @@ def main() -> None:
             send({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
 
 
-def predict_field(engine, obj_path, img_size, margin, blur=0.0):
+def predict_field(engine, obj_path, img_size, margin):
     """One forward pass: the occupancy probabilities and the normalization.
 
     Returns `(field, params)`, or `(None, None)` when the sketch has too few
     points to voxelize. `field` is float in [0, 1] on the method's own
-    `img_size ** 3` grid, already blurred if asked for — everything
-    downstream (the quantized grid, the marching cubes, an inpainting
-    constraint) reads this one array, so they cannot disagree about what was
-    predicted.
-
-    `blur` is a Gaussian over the field in voxels, applied to the
-    probabilities before anything looks at them. Clamped edges and a 3σ
-    truncation, matching `engine/volumeBlur.ts`, so the client's own slider is
-    the same operator applied twice over rather than a different one.
+    `img_size ** 3` grid, exactly as the network produced it — smoothing is a
+    separate step, applied by whoever wants it and not by whoever asked for
+    the prediction.
     """
     import torch
 
@@ -104,13 +99,18 @@ def predict_field(engine, obj_path, img_size, margin, blur=0.0):
     with torch.no_grad():
         logits = engine.model(torch.from_numpy(input_np).to(engine.device))
         probs = torch.sigmoid(logits)
-    field = probs.cpu().numpy()[0, 0]
+    return probs.cpu().numpy()[0, 0], params
 
-    if blur > 0:
-        from scipy.ndimage import gaussian_filter
 
-        field = gaussian_filter(field, sigma=blur, mode="nearest", truncate=3.0)
-    return field, params
+def blur_field(field, blur):
+    """A Gaussian over the probabilities, in voxels. Clamped edges and a 3σ
+    truncation, matching `engine/volumeBlur.ts`, so the client's own slider is
+    the same operator applied twice over rather than a different one."""
+    if blur <= 0:
+        return field
+    from scipy.ndimage import gaussian_filter
+
+    return gaussian_filter(field, sigma=blur, mode="nearest", truncate=3.0)
 
 
 def write_probability_grid(field, params, out_stem, blur) -> None:
@@ -211,10 +211,10 @@ def save_probability_grid(
     component pruning, normal repair — is a decision made at one threshold,
     so this stops before it and keeps the field itself.
     """
-    field, params = predict_field(engine, obj_path, img_size, margin, blur)
+    field, params = predict_field(engine, obj_path, img_size, margin)
     if field is None:
         return False
-    write_probability_grid(field, params, out_stem, blur)
+    write_probability_grid(blur_field(field, blur), params, out_stem, blur)
     return True
 
 
@@ -224,15 +224,18 @@ def save_grid_and_mesh(
 ) -> bool:
     """One prediction, published both ways: the field and a mesh of it.
 
-    The mesh is marched on the same array that gets quantized, blur included,
-    so what a caller renders and what it thresholds are the same surface at
-    the same level — which is the whole reason this is one function and not
-    two calls.
+    The blur reaches the grid only. It exists to soften an *inpainting
+    constraint* — to close the pinholes a hard threshold on a noisy field
+    leaves, at the cost of moving the level set — and none of that is a reason
+    to smooth the geometry. Marching cubes runs on the raw probabilities, so
+    the surface is the one ns2s would have produced on its own at this
+    threshold, and the mesh post-process (`smooth.py`) stays the only thing
+    that changes its shape.
     """
-    field, params = predict_field(engine, obj_path, img_size, margin, blur)
+    field, params = predict_field(engine, obj_path, img_size, margin)
     if field is None:
         return False
-    write_probability_grid(field, params, prob_stem, blur)
+    write_probability_grid(blur_field(field, blur), params, prob_stem, blur)
     # the grid is worth keeping even if the mesh comes out empty: a caller
     # constraining with it does not need the surface
     return mesh_field(field, params, threshold, out_stem, npz_path)

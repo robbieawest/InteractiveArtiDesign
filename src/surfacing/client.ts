@@ -135,6 +135,13 @@ export interface ViewSpec {
   /** Elevation of the last view under `helix`, in radians. Ignored by
    *  `ring`. Capped short of vertical by the renderer. */
   pitchMax?: number;
+  /** Yaw of the first view, in radians, with the rest spaced evenly after it.
+   *  Defaults to 0, which is dead-on front. It exists for single-view methods:
+   *  with `count: 1` the only camera would otherwise sit square to the sketch,
+   *  which hides depth, and a three-quarter view is what a person would pick
+   *  to show a shape in one picture. A full orbit is unaffected by where it
+   *  starts, so this changes nothing for multi-view methods that omit it. */
+  yaw?: number;
   /** CSS colour string, e.g. "#dcdcdc". */
   strokeColor?: string;
   /** Tube radius as a fraction of the sketch's bounding radius; 0 draws

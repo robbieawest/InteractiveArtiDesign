@@ -28,6 +28,23 @@ class SurfacingAdapter(ABC):
     # trivial run never costs a benchmark its warm worker.
     uses_gpu: bool = True
 
+    @staticmethod
+    def available() -> bool:
+        """Whether this machine can run this method at all.
+
+        Almost every method says yes: it may still fail for want of a checkout
+        or a venv, and that failure carries a message saying how to fix it,
+        which is more useful than a method quietly missing. This is for the
+        case that no amount of installing fixes — `trellis2` is CUDA-only and
+        simply cannot exist on an AMD box — where a knob in the panel that can
+        never work is worse than an absent one.
+
+        Read by the server when it lists methods, not by the job runner: a
+        method that says no is not advertised, and asking for it by name still
+        gives the adapter's own error.
+        """
+        return True
+
     # User-editable parameters, rendered generically by the Surfacer panel
     # and passed back (by `name`) inside the job's `options` dict. Each spec:
     #   { name, label, type: "int"|"float"|"bool"|"choice", default,

@@ -10,7 +10,7 @@ import {
   type JointPose,
 } from "../core/articulation";
 import { identityRigid } from "../core/rigid";
-import { getSurfaceMatcap, injectFresnelRim } from "./surfaceMatcap";
+import { buildOverlaySurfaceMaterial } from "./surfaceMatcap";
 import type { SurfacingSketch } from "../surfacing/client";
 
 /** Appearance of the surface overlay, editable from the Surfacer panel. */
@@ -107,7 +107,7 @@ export class SurfacePreview {
     this.group.visible = true; // a fresh surface always shows
     // take over shading: replace the glb's materials (often with baked vertex
     // colours) with one matcap material we fully control
-    const material = (this.material ??= buildSurfaceMaterial());
+    const material = (this.material ??= buildOverlaySurfaceMaterial());
     scene.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
         // surfacing meshes (VNS marching cubes, concatenated parts) export
@@ -473,17 +473,3 @@ function disposeSubtree(root: THREE.Object3D, keep?: THREE.Material | null): voi
 function asArray(m: THREE.Material | THREE.Material[]): THREE.Material[] {
   return Array.isArray(m) ? m : [m];
 }
-
-/** A matcap material for the surface: reads form via a baked sphere image
- *  (no scene lights, stable under orbit), tinted by the style colour, with a
- *  fresnel rim injected so the silhouette reads even at low opacity. */
-function buildSurfaceMaterial(): THREE.MeshMatcapMaterial {
-  const material = new THREE.MeshMatcapMaterial({
-    matcap: getSurfaceMatcap(),
-    side: THREE.DoubleSide,
-    transparent: true,
-  });
-  injectFresnelRim(material, new THREE.Color(0xffffff), 0.5, 2.2, "add");
-  return material;
-}
-

@@ -3,6 +3,8 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import type { Viewport } from "./Viewport";
 import { buildStrokes, disposeSketchContent } from "./sketchRender";
 import type { SketchRenderStyle } from "./sketchRender";
+import { buildOverlaySurfaceMaterial } from "./surfaceMatcap";
+import type { SurfaceStyle } from "./SurfacePreview";
 import { DEFAULT_VOLUME_STYLE, VolumeGrid } from "./VolumeGrid";
 import type { VolumeStyle } from "./VolumeGrid";
 import type { SurfacingSketch } from "../surfacing/client";
@@ -83,6 +85,10 @@ export class TrellisInteractiveView {
   private latent: VolumeGrid | null = null;
   private processedMesh: THREE.Object3D | null = null;
   private rawMesh: THREE.Object3D | null = null;
+  /** Shared by both result meshes, so the style applies to whichever the
+   *  toggle is showing without re-walking the scene. */
+  private surfaceMaterial: THREE.MeshMatcapMaterial | null = null;
+  private surfaceStyle: SurfaceStyle = { color: "#ffaa3c", opacity: 1 };
   private frames: FlowFrames | null = null;
   private sketchCopies: THREE.Object3D[] = [];
   private labels: THREE.Sprite[] = [];
@@ -277,6 +283,24 @@ export class TrellisInteractiveView {
   }
 
   /** Tear the layout down and free everything it holds. */
+  /** Result colour and opacity, from the Surfacer panel's own controls — the
+   *  regions are copies of that surface and follow it. */
+  setSurfaceStyle(style: Partial<SurfaceStyle>): void {
+    this.surfaceStyle = { ...this.surfaceStyle, ...style };
+    this.applySurfaceStyle();
+    this.viewport.invalidate();
+  }
+
+  private applySurfaceStyle(): void {
+    const material = this.surfaceMaterial;
+    if (!material) return;
+    material.color.set(this.surfaceStyle.color);
+    material.opacity = this.surfaceStyle.opacity;
+    material.transparent = this.surfaceStyle.opacity < 1;
+    // a translucent double-sided surface sorts badly with depth writes on
+    material.depthWrite = this.surfaceStyle.opacity >= 1;
+  }
+
   clear(): void {
     // order matters: the volumes own their own geometry and textures and
     // dispose themselves, so they come out before the blanket sweep
@@ -294,6 +318,10 @@ export class TrellisInteractiveView {
     }
     this.processedMesh = null;
     this.rawMesh = null;
+    // already disposed by the sweep above (it dedupes within one mesh, and
+    // both result meshes hold this same one); dropped here so the next run
+    // builds a fresh one rather than tinting a dead material
+    this.surfaceMaterial = null;
     this.sketchOverlay = null; // freed with the rest of the sketch copies
 
     if (this.viewQuads) {
@@ -391,16 +419,22 @@ export class TrellisInteractiveView {
     if (!glb) return null;
     // parseAsync detaches its input; the caller keeps the bundle for redraws
     const gltf = await this.loader.parseAsync(glb.slice(0), "");
+    // The same material the viewport overlay uses, driven by the same colour
+    // and opacity: this region holds the run's own result, and it looking
+    // different here than it does outside the view would read as a difference
+    // in the mesh rather than in who is drawing it.
+    const material = (this.surfaceMaterial ??= buildOverlaySurfaceMaterial());
     gltf.scene.traverse((object) => {
       const mesh = object as THREE.Mesh;
       if (!mesh.isMesh) return;
-      mesh.material = new THREE.MeshStandardMaterial({
-        color: 0xffaa3c,
-        roughness: 0.6,
-        metalness: 0,
-        side: THREE.DoubleSide,
-      });
+      // marching-cubes output arrives with positions only, and matcap shading
+      // needs normals
+      if (!mesh.geometry.getAttribute("normal")) {
+        mesh.geometry.computeVertexNormals();
+      }
+      mesh.material = material;
     });
+    this.applySurfaceStyle();
     return gltf.scene;
   }
 }

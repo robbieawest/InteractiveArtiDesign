@@ -70,6 +70,24 @@ function makeMatcapTexture(): THREE.Texture {
   return texture;
 }
 
+/** The material every *result* surface is drawn with: the shared matcap, tinted
+ *  by `.color`, with a white fresnel rim so the silhouette reads even at low
+ *  opacity. Used by the viewport overlay and by the flow view's result region,
+ *  which is the same mesh and should not look like a different object for
+ *  being on the other side of a modal view.
+ *
+ *  Returned rather than shared, because each holder tints and fades its own
+ *  copy; the matcap texture underneath is what is shared. */
+export function buildOverlaySurfaceMaterial(): THREE.MeshMatcapMaterial {
+  const material = new THREE.MeshMatcapMaterial({
+    matcap: getSurfaceMatcap(),
+    side: THREE.DoubleSide,
+    transparent: true,
+  });
+  injectFresnelRim(material, new THREE.Color(0xffffff), 0.5, 2.2, "add");
+  return material;
+}
+
 /** Mix a fresnel term into a matcap material's outgoing light: the silhouette
  *  and every surface turning away from the camera go toward `color`.
  *

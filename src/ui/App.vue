@@ -1120,6 +1120,10 @@ async function enterFlowView(run: {
   activate("none");
   flowView ??= new TrellisInteractiveView(viewport);
   await flowView.show(run);
+  flowView.setSurfaceStyle({
+    color: surfaceColor.value,
+    opacity: surfaceOpacity.value,
+  });
 
   strokeRenderer?.setVisible(false);
   surfacePreview?.setVisible(false);
@@ -1208,6 +1212,8 @@ function setSurfaceOpacity(opacity: number): void {
 
 watch([surfaceColor, surfaceOpacity], ([color, opacity]) => {
   surfacePreview?.setStyle({ color, opacity });
+  // the flow view's result region holds a copy of the same surface
+  flowView?.setSurfaceStyle({ color, opacity });
 });
 
 function cycleGizmoMode(): void {

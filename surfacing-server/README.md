@@ -156,6 +156,8 @@ whole pipeline end to end.
 | `neuvas` | NeuVAS | `.venv-neuvas` | ~45 min per sketch, no weights needed |
 | `vrs2s` | VRSketch2Shape | `.venv-vrs2s` | *generates* a shape rather than fitting one |
 | `sf3d` | Piecewise-Smooth Surface Fitting | `.venv-sf3d` | CPU only; *refines* another adapter's output |
+| `trellis` | TRELLIS | `<checkout>/.venv` | generative; conditions on renders of the sketch |
+| `trellis2` | TRELLIS.2 | `<checkout>/.venv` | generative; **NVIDIA only**, geometry only |
 
 Every real adapter takes a **part-based** toggle: surface each part separately
 and merge the results (boolean union when every part came out watertight,
@@ -788,3 +790,177 @@ almost all is the pipeline load; both flow stages together run in about 8 s and
 decode ~124 k vertices. The result lands in a normalized cube, so `fit_to_sketch`
 scales it uniformly into the strokes' bounding box — uniformly, because fitting
 each axis independently would shear the shape the model inferred.
+
+### TRELLIS.2 (`trellis2`)
+
+[Xiang et al., 2025](https://microsoft.github.io/TRELLIS.2)
+([arXiv:2512.14692](https://arxiv.org/abs/2512.14692)), MIT-licensed, at
+<https://github.com/microsoft/TRELLIS.2>; we run the fork
+<https://github.com/robbieawest/TRELLIS.2> as the submodule
+`methods/TRELLIS.2`. A 4B-parameter image-to-3D model over a "field-free"
+sparse voxel representation (O-Voxel), which handles open surfaces and
+non-manifold geometry that FlexiCubes cannot.
+
+**NVIDIA only, and not by preference.** The weights want ≥24 GB of VRAM, and
+the stack — flash-attn, `cumesh`, `o-voxel`, `flexgemm`, nvdiffrast — is CUDA
+throughout, with no AMD counterpart of the kind TRELLIS-AMD is for TRELLIS 1.
+So `backends.json` carries a `trellis2` entry under `cuda` and none under
+`rocm`, and that absence is what the method's availability is read from:
+`SurfacingAdapter.available()` (new, default `True`) returns false with no
+entry, `/api/health` drops the method from its list, and the panel never shows
+a knob this machine could not act on. Naming it in a job anyway still reaches
+the adapter and gets its own explanation rather than "unknown method". It is a
+cluster method here; the local RX 7800 XT cannot run it at any setting.
+
+**Low-VRAM mode is the default, and it is load-bearing.** TRELLIS.2 ships
+`low_vram = True`, where `pipeline.cuda()` deliberately does *not* move the
+weights — it records the device, and each stage moves its own model on and off
+around the work it does. At 4B parameters that is the difference between
+fitting on a card and not. Code that owns its own sampling loop has to honour
+the same contract or the first matmul meets a model still on the CPU, which is
+what `sketchflow.run.resident` is for.
+
+**Why it earns a second adapter rather than a flag on `trellis`.** Stage 1 is
+*the same latent space*: `configs/gen/ss_flow_img_dit_1_3B_64_bf16.json` gives
+the sparse-structure flow `resolution 16, in_channels 8` and names
+`microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16` as its decoder —
+TRELLIS.2 reuses TRELLIS 1's sparse-structure VAE unchanged. Every piece of the
+sketch-inpainting work therefore carries over as-is: the 64³ voxelization of
+strokes and of the NS2S surface shell, the `ss_enc_conv3d_16l8_fp16` encoder,
+the weighted mix and the release schedule. What differs is everything *around*
+stage 1, and it differs enough that folding it into `trellis` would make every
+parameter row conditional on a version switch:
+
+| | `trellis` | `trellis2` |
+| --- | --- | --- |
+| image condition | DINOv2 @518, `run_multi_image` | DINOv3 ViT-L/16 @512 and @1024, **one image, no multi-image path** |
+| stage 2 | SLat → FlexiCubes @256³ | O-Voxel shape SLat + separate texture SLat, 512³–1536³, cascade variants |
+| stage-1 coords | 64³ | 32³ for the 512 pipeline (decoder's 64³, max-pooled) |
+| output | verts/faces → trimesh | `MeshWithVoxel`; `decode_shape_slat` alone yields verts/faces |
+| cost | ~4 GB | 4B params, ≥24 GB |
+
+Four consequences for the adapter:
+
+- **The constraint mixes in x₀ space by default.** `constraint_mix` chooses
+  between `x0` (default) and `repaint` (TRELLIS 1's behaviour). Owning the flow
+  made the two comparable, and the algebra says they are the same method apart
+  from one term: the latent-space mix also blends the *noise*, which shrinks it
+  to `√((1−s)²+s²)` of the scale `t` calls for — ~29% short at `s = 0.5`, over
+  the whole grid, since the mask that works is uniform. Blending the two clean
+  latents and re-noising once with the model's own residual keeps the state on
+  the manifold and removes the fixed noise draw from the method entirely. Full
+  derivation in `TRELLIS-EXPERIMENTS.md`.
+- **One view, raised and off-axis.** There is no `inject_sampler_multi_image`
+  to borrow and nothing was trained on multiple views, so the conditioner sends
+  a single three-quarter render looking down at the sketch. The client renderer
+  is unchanged apart from a `yaw` field on `ViewSpec` — with `count: 1`,
+  `orbitDirections` puts the only camera at yaw 0, which is a dead-on front
+  view; `pitch` already supplies the elevation. Rendered at `size: 1024`,
+  because `preprocess_image` downscales only above that, so 1024 reaches both
+  the 512 and 1024 conditioning resolutions without a resample.
+- **Geometry only.** `decode_shape_slat` returns meshes on its own — texture
+  lives in a separate SLat with its own flow model — so the texture stage is
+  never sampled, `o_voxel.postprocess.to_glb` never runs, and the venv does not
+  need to satisfy the PBR export path. Nothing downstream reads materials:
+  `SurfacePreview` shows geometry.
+- **`pipeline_type` defaults to `512`** (~3 s of sampling on an H100) and the
+  1024 and cascade paths stay off until the memory work is done. They are a
+  parameter, not a rewrite, so turning them on later is a default change.
+
+#### The flow is ours, and nothing is patched
+
+The `trellis` adapter reaches into the method at runtime: it swaps `sample_once`
+on the sampler instance for the length of a run so the constraint can be mixed
+into `pred_x_prev`, and composes that with upstream's own `_inference_model`
+patch for multi-image. It works, and it is very hard to read — answering "what
+maths ran on step 7" means unfolding a mixin MRO and two live monkeypatches.
+
+`trellis2` does not do that. The sampling loop is **written out explicitly and
+owned by us**, and `trellis2/` itself is never edited or patched:
+
+```
+x      = randn(...)                          # x at t = 1 IS noise; nothing else seeds it
+t_seq  = linspace(1, 0, steps+1);  t ← rescale_t·t / (1 + (rescale_t−1)·t)
+per (t, t_prev):
+    v    = flow(x, 1000·t, cond)         # CFG: g·v_pos + (1−g)·v_neg,
+                                         # g forced to 1 outside guidance_interval
+    x̂_0 = (1−σ)·x − (σ + (1−σ)·t)·v      # the prior's implied endpoint (captured)
+    ε   = (1−t)·v + x                    # its residual: the noise the model sees in x
+
+    if constraint_mix == "x0":           # default
+        x̃_0 = x̂_0 + s·c·(z_c − x̂_0)    # blend two CLEAN latents
+        x    = (1−t_prev)·x̃_0 + (σ + (1−σ)·t_prev)·ε      # re-noise once, to t_prev
+    else:                                # "repaint": TRELLIS 1's behaviour
+        x    = x − (t − t_prev)·v                          # Euler step
+        k    = (1−t_prev)·z_c + (σ + (1−σ)·t_prev)·ε_fix   # constraint, noised
+        x    = x + s·c·(k − x)
+```
+
+The two branches differ in one term. `(1−t_prev)·x̂_0 + λ'·ε` is *identically*
+`x − (t−t_prev)·v`, so the `x0` branch is the Euler step with the clean part
+blended; the `repaint` branch blends the noise as well, and blending two
+unit-scale noises shrinks them.
+
+That is the whole of `flow_euler.py` plus both guidance mixins, in about forty
+lines with no `edict` and no `super()` chain. `SparseTensor` implements
+`__add__`/`__sub__`/`__mul__`, so the same loop drives stage 1 (dense
+`[N,8,16,16,16]`) and stage 2 (sparse features), exactly as upstream's one
+sampler does. The models — the DiTs, `sparse_structure_decoder`,
+`shape_slat_decoder`, the DINOv3 extractor, `SparseTensor` — are *used as
+components*, called the way `trellis2/pipelines/trellis2_image_to_3d.py` calls
+them. We replace the sampler and the orchestration, not the network.
+
+That code cannot live in this server's environment: it imports `trellis2`,
+`flash_attn` and torch. So it lives in the fork, as a **top-level `sketchflow/`
+package beside `trellis2/`, never inside it** — the diff against
+microsoft/TRELLIS.2 stays "one added directory", which is trivially rebasable
+onto upstream releases.
+
+| where | what it owns |
+| --- | --- |
+| `methods/TRELLIS.2/sketchflow/` | component loading, the explicit flow loop, the constraint (grid → 16³ latent, weights/masks/release, the mix), per-step capture |
+| `adapters/trellis2_worker.py` | the JSON-lines protocol and nothing else: read config, call `sketchflow`, emit events |
+| `adapters/trellis2.py` | sketch → 64³ voxelization, the NS2S surface grid, the fit back to the strokes, glb, params — torch-free, server-side |
+
+The corollary is that a run's identity now includes the **fork's commit**, not
+just seed and steps: the flow logic and the app advance under two different
+SHAs, and `git submodule update` can change what an old benchmark would
+reproduce. The worker records it in the run config for that reason.
+
+#### Install
+
+Not yet performed on any machine here — this section is the intended shape, not
+a transcript. Upstream's own instructions are in the checkout's `README.md`.
+
+```bash
+git submodule update --init surfacing-server/methods/TRELLIS.2
+# eigen is a nested submodule of o-voxel and is needed only to COMPILE it;
+# skip it and the build fails deep in a C++ include, not at clone time
+cd surfacing-server/methods/TRELLIS.2
+git submodule update --init --recursive o-voxel
+```
+
+The venv lives inside the checkout (`<repo>/.venv`), as it does for `trellis`,
+and for the same reasons; override with `TRELLIS2_REPO` / `TRELLIS2_PYTHON`.
+Skip `setup.sh --new-env` (it makes a conda env named `trellis2`, while the
+adapter resolves an interpreter from `backends.json`), create the venv first
+and source the script into it. Upstream builds against torch 2.6.0 / CUDA 12.4
+and needs `CUDA_HOME` pointed at a matching toolkit — several of those flags
+compile CUDA kernels, so a node with drivers but no toolkit cannot install this
+method at all.
+
+Which flags geometry-only actually needs is decidable by reading the imports,
+and TRELLIS.2 makes that a real saving where TRELLIS 1 did not. Every
+`__init__.py` here resolves its members lazily through `__getattr__`, so
+importing `Trellis2ImageTo3DPipeline` never drags in the texturing pipeline or
+the renderers — the opposite of TRELLIS 1, where `pipelines/__init__.py`
+imported every pipeline and one `ModuleNotFoundError` from a module the mesh
+path never calls could stop the whole import. So:
+
+| flag | needed geometry-only | why |
+| --- | --- | --- |
+| `--basic`, `--flash-attn` | yes | attention backend for the DiTs (`xformers` is the fallback for cards without flash-attn) |
+| `--o-voxel` | yes | `models/sc_vaes/fdg_vae.py` imports `o_voxel.convert` at module level — it *is* the shape decoder |
+| `--cumesh` | yes | `representations/mesh/base.py` imports it at module level |
+| `--flexgemm` | yes | sparse ops under the SLat models |
+| `--nvdiffrast`, `--nvdiffrec` | no | only `renderers/` and `trellis2_texturing.py`, neither of which the shape path imports |
