@@ -224,6 +224,13 @@
             @scroll="onLogScroll"
             >{{ surfacingLog.join("\n") }}</pre
           >
+          <!-- One replaced-in-place line, not log history: the adapter's label
+               for the step it is on. The percentage cannot stand in for it —
+               `rescale_t` makes the flow steps wildly non-uniform, so "50%"
+               and "t 0.500->0.313" are very different facts. -->
+          <p v-if="surfacing && surfacingMessage" class="surf-status">
+            {{ surfacingMessage }}
+          </p>
           <div class="panel-actions">
             <button
               :disabled="surfacing || methods.length === 0"
@@ -379,6 +386,8 @@ const props = defineProps<{
   surfacingOptions: MethodOptions;
   surfacing: boolean;
   surfacingProgress: number;
+  /** The adapter's label for the current step, shown while a job runs. */
+  surfacingMessage: string;
   hasSurface: boolean;
   /** Surface overlay appearance (applies live to the shown mesh). */
   surfaceColor: string;
@@ -623,6 +632,22 @@ const headerTooltips: Record<PanelName, string> = {
 
 .mini.danger:hover {
   background: #ffb3b3;
+}
+
+.surf-status {
+  /* same reason as .surf-log above: a flex child in the panel's column is
+     shrunk to fit `max-height: 40vh`, and `overflow: hidden` below means the
+     text cannot push back — without this the line renders at zero height */
+  flex: none;
+  margin: 4px 0 0;
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  color: #555555;
+  /* the flow labels carry a t range; keep it on one line and let the front
+     of the string win, since that is the step number */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .panel-actions {

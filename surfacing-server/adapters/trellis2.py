@@ -64,6 +64,19 @@ WORKER = Path(__file__).resolve().parent / "trellis2_worker.py"
 DEFAULT_MODEL = "microsoft/TRELLIS.2-4B"
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    """A float, or `None` for "leave the checkpoint's own value alone".
+
+    `None` and any negative number both mean unset. The negative is there
+    because the UI sends every declared option on every run, so there is no way
+    for a float slider to express absence — -1 is the sentinel it uses, and the
+    real range starts at 0.
+    """
+    if value is None or float(value) < 0:
+        return None
+    return float(value)
+
+
 class SingleViewConditioner(ClientViewsConditioner):
     """One raised three-quarter render of the strokes.
 
@@ -300,6 +313,59 @@ class Trellis2Adapter(SurfacingAdapter):
             "than the structure stage on purpose.",
         },
         {
+            "name": "ss_guidance_rescale",
+            "label": "TRELLIS.2: structure guidance rescale",
+            "type": "float",
+            "default": -1.0,
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.05,
+            "help": "CFG rescale for the structure stage — new in TRELLIS.2, "
+            "TRELLIS 1 has no equivalent. Guidance at 7.5 extrapolates far "
+            "outside the two predictions and inflates the spread of the clean "
+            "estimate it implies; this divides that back out, blending the "
+            "corrected estimate in at this weight. 0 is off, 1 is fully "
+            "renormalized, and -1 means leave the checkpoint's own value "
+            "alone (upstream's demo uses 0.7 here).",
+        },
+        {
+            "name": "ss_rescale_t",
+            "label": "TRELLIS.2: structure step schedule",
+            "type": "float",
+            "default": -1.0,
+            "min": -1.0,
+            "max": 6.0,
+            "step": 0.1,
+            "help": "How the flow steps are distributed over t. 1 is uniform; "
+            "higher bunches them toward t=1, where structure is decided, so "
+            "the last step covers a longer stretch of the trajectory on its "
+            "own. TRELLIS.2 ships 5 for this stage against TRELLIS 1's 3, "
+            "which is why its coarse phase runs so much longer before the "
+            "shape resolves. -1 leaves the checkpoint's own value alone.",
+        },
+        {
+            "name": "slat_rescale_t",
+            "label": "TRELLIS.2: latent step schedule",
+            "type": "float",
+            "default": -1.0,
+            "min": -1.0,
+            "max": 6.0,
+            "step": 0.1,
+            "help": "The same distribution for the latent stage, where "
+            "upstream uses 3. -1 leaves the checkpoint's own value alone.",
+        },
+        {
+            "name": "slat_guidance_rescale",
+            "label": "TRELLIS.2: latent guidance rescale",
+            "type": "float",
+            "default": -1.0,
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.05,
+            "help": "The same term for the latent stage, where upstream's "
+            "demo uses 0.5. -1 leaves the checkpoint's own value alone.",
+        },
+        {
             "name": "preprocess",
             "label": "TRELLIS.2: preprocess the view",
             "type": "bool",
@@ -435,6 +501,20 @@ class Trellis2Adapter(SurfacingAdapter):
             "ss_cfg": float(options.pop("ss_cfg", 7.5)),
             "slat_steps": int(options.pop("slat_steps", 12)),
             "slat_cfg": float(options.pop("slat_cfg", 3.0)),
+            # None means "leave the checkpoint's own value alone" — the
+            # schedule only overrides what is not None. TRELLIS.2 ships a CFG
+            # rescale term that TRELLIS 1 has no equivalent for, so there is no
+            # sensible default to hardcode here.
+            "ss_guidance_rescale": _optional_float(
+                options.pop("ss_guidance_rescale", None)
+            ),
+            "ss_rescale_t": _optional_float(options.pop("ss_rescale_t", None)),
+            "slat_rescale_t": _optional_float(
+                options.pop("slat_rescale_t", None)
+            ),
+            "slat_guidance_rescale": _optional_float(
+                options.pop("slat_guidance_rescale", None)
+            ),
             "preprocess": bool(options.pop("preprocess", True)),
             "no_image_cond": bool(options.pop("no_image_cond", False)),
             "sketch_inpaint": bool(options.pop("sketch_inpaint", True)),

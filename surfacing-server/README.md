@@ -929,25 +929,171 @@ reproduce. The worker records it in the run config for that reason.
 
 #### Install
 
-Not yet performed on any machine here — this section is the intended shape, not
-a transcript. Upstream's own instructions are in the checkout's `README.md`.
+Not yet performed on any machine here — this is read off `setup.sh` rather
+than transcribed from a run, so expect one or two surprises.
 
 ```bash
 git submodule update --init surfacing-server/methods/TRELLIS.2
-# eigen is a nested submodule of o-voxel and is needed only to COMPILE it;
-# skip it and the build fails deep in a C++ include, not at clone time
 cd surfacing-server/methods/TRELLIS.2
+# eigen is a nested submodule of o-voxel and is needed to COMPILE it. Not
+# optional and not deferrable: `--o-voxel` does `cp -r o-voxel /tmp/extensions`
+# and builds the copy, so an uninitialized third_party/eigen is copied empty
+# and the build dies in a C++ include rather than at clone time.
 git submodule update --init --recursive o-voxel
+
+# The venv lives inside the checkout — backends.json expects
+# <repo>/.venv/bin/python — for the same reason TRELLIS 1's does: upstream
+# pins its own torch, which has no business in the `.venv-*` envs beside the
+# server. Override with TRELLIS2_REPO / TRELLIS2_PYTHON.
+# uv, with --seed: setup.sh calls plain `pip`, which a bare `uv venv` does not
+# provide. Same shape as TRELLIS 1's venv and as the `.venv-*` ones
+# setup_venvs.sh builds.
+uv venv --python 3.10 --seed .venv
+source .venv/bin/activate
+
+# torch FIRST. Every extension below installs --no-build-isolation, so it
+# compiles against whatever torch is already in the environment; install them
+# first and pip builds against a torch it fetches and discards.
+uv pip install torch==2.6.0 torchvision==0.21.0 \
+  --index-url https://download.pytorch.org/whl/cu124
+
+# A TOOLKIT IS NOT OPTIONAL HERE — see below. Without a system one, assemble
+# CUDA_HOME out of PyPI wheels, into this venv, no root involved:
+uv pip install nvidia-cuda-nvcc-cu12 nvidia-cuda-runtime-cu12 nvidia-cuda-cccl-cu12
+export CUDA_HOME="$PWD/.venv/cuda"
+python - <<'PY'      # stitch the separate nvidia/* trees into one prefix
+import os, pathlib, sysconfig
+site = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia"
+home = pathlib.Path(os.environ["CUDA_HOME"]); home.mkdir(parents=True, exist_ok=True)
+for sub in ("bin", "include", "lib"):
+    (home / sub).mkdir(exist_ok=True)
+    for src in site.glob(f"*/{sub}/*"):
+        link = home / sub / src.name
+        if not link.exists(): link.symlink_to(src)
+PY
+"$CUDA_HOME/bin/nvcc" --version      # must agree with torch's cu124
+
+# --basic BY HAND, because the flag runs `sudo apt install -y libjpeg-dev` and
+# then builds pillow-simd against it. No sudo here, and Pillow is already
+# present via torchvision. This is that list minus those two lines, and minus
+# gradio (the demo UI, which pins 6.0.1 and pulls a large tree).
+#
+# transformers is PINNED BELOW 5. `DinoV3FeatureExtractor.extract_features`
+# reimplements the forward pass and walks `self.model.layer`
+# (image_feature_extractor.py:86). transformers 4.5x puts that ModuleList
+# directly on DINOv3ViTModel; 5.x moved it into a nested DINOv3ViTEncoder at
+# `.model.layer`, so the loop raises `'DINOv3ViTModel' object has no attribute
+# 'layer'` — at the first conditioning call, after the 4B download. 4.57.6 is
+# the last 4.x and still flat.
+uv pip install imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
+               ninja trimesh transformers==4.57.6 tensorboard pandas lpips \
+               zstandard kornia timm
+uv pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# xformers rather than flash-attn, exactly as on TRELLIS 1: a prebuilt wheel
+# version-matched to torch, against an sdist whose kernels take hours and many
+# GB to compile. ATTN_BACKEND picks it at runtime (backends.json exports it).
+uv pip install xformers
+
+# the compiled extensions the shape path needs. Source it (`. ./setup.sh`) —
+# the help path ends in `return`, so it is written to be sourced.
+rm -rf /tmp/extensions    # see below: the script does not tolerate its leftovers
+. ./setup.sh --cumesh --flexgemm --o-voxel --nvdiffrast
 ```
 
-The venv lives inside the checkout (`<repo>/.venv`), as it does for `trellis`,
-and for the same reasons; override with `TRELLIS2_REPO` / `TRELLIS2_PYTHON`.
-Skip `setup.sh --new-env` (it makes a conda env named `trellis2`, while the
-adapter resolves an interpreter from `backends.json`), create the venv first
-and source the script into it. Upstream builds against torch 2.6.0 / CUDA 12.4
-and needs `CUDA_HOME` pointed at a matching toolkit — several of those flags
-compile CUDA kernels, so a node with drivers but no toolkit cannot install this
-method at all.
+Four things about that script worth knowing before it fails:
+
+* **It needs `nvidia-smi` on PATH** to pick a platform, and `exit 1`s when it
+  finds neither that nor `rocminfo` (line 66). Sourced on a login node without
+  a GPU, that `exit` closes your shell. Install on a GPU node.
+* **`/tmp/extensions` is not reused, it is collided with.** `--cumesh` and
+  `--flexgemm` `git clone` into fixed paths there, which fails outright if the
+  directory is left over from an earlier attempt; `--o-voxel` `cp -r`s into it,
+  which silently nests a second copy inside the first. Clear it between runs.
+* **`--cumesh` and `--flexgemm` clone from GitHub at install time**
+  (`JeffreyXiang/CuMesh`, `JeffreyXiang/FlexGEMM`, both `--recursive`), so the
+  building machine needs network — the same trap FlexiCubes is for TRELLIS 1,
+  one level further out.
+* **Skip `--new-env`.** It makes a conda environment named `trellis2`, while
+  the adapter resolves an interpreter from `backends.json`.
+
+**`nvcc` is mandatory here, and geometry-only does not get you out of it.** On
+TRELLIS 1 a missing toolkit cost exactly one stage (`fill_holes`) and the
+adapter runs fine without it. On TRELLIS.2 it costs the method:
+
+| dependency | why it is unavoidable | needs nvcc |
+| --- | --- | --- |
+| `o-voxel` | `models/sc_vaes/fdg_vae.py` imports `o_voxel.convert` at module level — it **is** the shape decoder | yes: `CUDAExtension` over `hash.cu`, `rasterize.cu`, `serialize/*.cu` |
+| `cumesh` | `representations/mesh/base.py` imports it at module level | yes: source build, cloned at install |
+| `flexgemm` | default sparse conv backend | yes, but `SPARSE_CONV_BACKEND=spconv` takes a prebuilt wheel instead |
+| flash-attn | attention | yes — so use `xformers`, a matched prebuilt wheel |
+| `nvdiffrast` | `o-voxel/o_voxel/__init__.py` imports **all** its submodules eagerly, and `postprocess.py` does `import nvdiffrast.torch` at module level — so loading the shape decoder needs it even though nothing here rasterizes | yes: `CUDAExtension` at install time. v0.4.0 dropped the OpenGL rasterizer, so no EGL/GL headers are needed |
+
+Neither of the first two has a wheel, a CPU fallback, or a way to import the
+package without the compiled `_C` module, so there is no version of "decode
+geometry on TRELLIS.2" that skips the compiler. The two escape hatches below
+them are still worth taking, because each one avoids a long build, not because
+they avoid the toolkit.
+
+The toolkit itself does not have to be a system install: `nvidia-cuda-nvcc-cu12`
+and friends are PyPI wheels, and the install block above stitches their
+separate `site-packages/nvidia/*` trees into one `CUDA_HOME` inside the venv.
+That route is described in "Machines without a CUDA toolkit" below as rarely
+worth it for TRELLIS 1 — for TRELLIS.2 it is the only way in on a node without
+one. Untested here; the wheel set may need `nvidia-cuda-nvrtc-cu12` as well,
+and `-arch` has to match the card.
+
+**`ATTN_BACKEND=sdpa` is the same trap it is on TRELLIS 1**, for the same
+reason and in the same place. `modules/attention/config.py` accepts
+`['xformers', 'flash_attn', 'flash_attn_3', 'sdpa', 'naive']`, but
+`modules/sparse/config.py` accepts only `['xformers', 'flash_attn',
+'flash_attn_3']` — so `sdpa` sets the dense path and leaves the sparse one on
+its `flash_attn` default, which then fails for the flash-attn you were avoiding.
+One variable drives both: `SPARSE_ATTN_BACKEND` falls back to `ATTN_BACKEND`
+when unset. Both modules print their choice at import, which is the only
+confirmation the value landed.
+
+**A 401 from Hugging Face is not a Hugging Face problem** — `trellis2` inherits
+TRELLIS 1's swallow-everything model loader verbatim
+(`trellis2/pipelines/base.py:43`): a failure loading a submodel from the local
+snapshot is retried as a Hub *repo id*, and the Hub answers 401 for repos that
+do not exist. Read `Invalid username or password` as "an import failed upstream
+of the model load" and look above the `During handling of the above exception`
+line. Check the chain before spending a 4B download on it:
+
+```bash
+ATTN_BACKEND=xformers .venv/bin/python -c "
+import trellis2.modules.attention, trellis2.modules.sparse
+from trellis2.pipelines import Trellis2ImageTo3DPipeline
+import o_voxel, cumesh; print('ok')"
+```
+
+**Four model repos are fetched at runtime, and two of them are gated.** This
+is the one place TRELLIS.2 genuinely needs a Hugging Face account, so it is
+worth separating from the false 401 above.
+
+| repo | what for | gate |
+| --- | --- | --- |
+| `microsoft/TRELLIS.2-4B` | the pipeline | none |
+| `microsoft/TRELLIS-image-large` | the sparse-structure *encoder* the constraint needs (`ss_enc_conv3d_16l8_fp16` — TRELLIS.2 reuses that VAE) | none |
+| `facebook/dinov3-vitl16-pretrain-lvd1689m` | `image_cond_model`, the only conditioning path | **manual** — request access and wait for approval |
+| `briaai/RMBG-2.0` | `rembg_model`, background removal | **auto** — still needs the account and a token; the difference is that accepting the terms grants access immediately, with no approval to wait on |
+
+Both gated ones are constructed unconditionally by
+`Trellis2ImageTo3DPipeline.from_pretrained` (lines 104-105), so `preprocess`
+being off does not get you out of the RMBG gate — the model is built at load
+whether or not a run ever calls it. Accept both gates on the account, mint a
+read token, and let `huggingface_hub` find it the ordinary way:
+
+```bash
+hf auth login          # writes ~/.cache/huggingface/token
+```
+
+Keep the token out of `backends.json` — that file is in git. And do **not**
+set `HF_HUB_DISABLE_IMPLICIT_TOKEN` here: it stops the hub attaching the stored
+token, which is exactly what the gated repos need.
+
+A machine that runs offline needs all four in its HF cache.
 
 Which flags geometry-only actually needs is decidable by reading the imports,
 and TRELLIS.2 makes that a real saving where TRELLIS 1 did not. Every
@@ -959,8 +1105,9 @@ path never calls could stop the whole import. So:
 
 | flag | needed geometry-only | why |
 | --- | --- | --- |
-| `--basic`, `--flash-attn` | yes | attention backend for the DiTs (`xformers` is the fallback for cards without flash-attn) |
-| `--o-voxel` | yes | `models/sc_vaes/fdg_vae.py` imports `o_voxel.convert` at module level — it *is* the shape decoder |
-| `--cumesh` | yes | `representations/mesh/base.py` imports it at module level |
-| `--flexgemm` | yes | sparse ops under the SLat models |
+| `--basic` | by hand | the packages yes, the flag no — it `sudo apt`s for libjpeg and builds pillow-simd on it |
+| `--flash-attn` | **no** — use xformers | an sdist whose kernels take hours to build; xformers is a matched wheel and `ATTN_BACKEND` picks it. `sdpa` is not an option (see above) |
+| `--o-voxel` | **yes** | `models/sc_vaes/fdg_vae.py` imports `o_voxel.convert` at module level — it *is* the shape decoder |
+| `--cumesh` | **yes** | `representations/mesh/base.py` imports it at module level |
+| `--flexgemm` | yes, or spconv | the default sparse conv backend; `SPARSE_CONV_BACKEND` takes `spconv`/`torchsparse` instead |
 | `--nvdiffrast`, `--nvdiffrec` | no | only `renderers/` and `trellis2_texturing.py`, neither of which the shape path imports |

@@ -15,6 +15,8 @@ function bundle(options: {
   version?: number;
   truncate?: number;
   fill?: (stage: string, step: number) => number;
+  structureTimes?: number[];
+  latentTimes?: number[];
 }): ArrayBuffer {
   const { grid, structure, latent } = options;
   const frameBytes = grid ** 3;
@@ -23,8 +25,13 @@ function bundle(options: {
     frameBytes,
     align: options.align ?? null,
     stages: [
-      { name: "structure", offset: 0, steps: structure },
-      { name: "latent", offset: structure * frameBytes, steps: latent },
+      { name: "structure", offset: 0, steps: structure, times: options.structureTimes },
+      {
+        name: "latent",
+        offset: structure * frameBytes,
+        steps: latent,
+        times: options.latentTimes,
+      },
     ],
   });
   const headerBytes = new TextEncoder().encode(header);
@@ -221,5 +228,39 @@ describe("the constraint track", () => {
     expect(stageLengths(frames).total).toBe(2);
     expect(frames.stages.structure[0][0]).toBe(1);
     expect(frames.stages.latent[0][0]).toBe(2);
+  });
+});
+
+describe("flow times", () => {
+  it("reads the per-step times a capture recorded", () => {
+    const frames = decodeFlowFrames(
+      bundle({
+        grid: 4,
+        structure: 3,
+        latent: 2,
+        structureTimes: [1, 0.625, 0.3125],
+        latentTimes: [1, 0.5],
+      }),
+    );
+    expect(frames.times.structure).toEqual([1, 0.625, 0.3125]);
+    expect(frames.times.latent).toEqual([1, 0.5]);
+  });
+
+  it("is empty for a capture that recorded none", () => {
+    // TRELLIS 1 bundles, and TRELLIS.2 runs from before the field existed.
+    // The scrubber falls back to the step index, so this must not throw.
+    const frames = decodeFlowFrames(bundle({ grid: 4, structure: 3, latent: 2 }));
+    expect(frames.times.structure).toEqual([]);
+    expect(frames.times.latent).toEqual([]);
+    expect(stageLengths(frames).total).toBe(5);
+  });
+
+  it("drops a times array that does not match the step count", () => {
+    // a mismatch would silently label every step with the wrong t
+    const frames = decodeFlowFrames(
+      bundle({ grid: 4, structure: 3, latent: 2, structureTimes: [1, 0.5] }),
+    );
+    expect(frames.times.structure).toEqual([]);
+    expect(locateFrame(frames, 0)?.stage).toBe("structure");
   });
 });

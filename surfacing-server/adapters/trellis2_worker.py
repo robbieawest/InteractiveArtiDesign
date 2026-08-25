@@ -54,7 +54,7 @@ def progress(stage: str, frac: float, message: str = "") -> None:
     _emit("progress", stage=stage, frac=frac, message=message)
 
 
-def write_frames(frames: dict, directory: Path) -> None:
+def write_frames(frames: dict, times: dict, directory: Path) -> None:
     """Frames to disk as one flat file plus a manifest.
 
     Down the pipe would mean base64 through a line-delimited JSON protocol that
@@ -76,9 +76,16 @@ def write_frames(frames: dict, directory: Path) -> None:
             offset = handle.tell()
             for frame in frames[stage]:
                 handle.write(frame)
-            manifest["stages"].append({
+            entry = {
                 "name": stage, "offset": offset, "steps": len(frames[stage]),
-            })
+            }
+            # Optional, and the client treats it as such: TRELLIS 1 bundles
+            # carry no times and still scrub. That is why this is an added
+            # field rather than a bundle version bump — a capture never
+            # outlives its job directory, so there is nothing old to read.
+            if times.get(stage):
+                entry["times"] = [round(float(t), 6) for t in times[stage]]
+            manifest["stages"].append(entry)
     (directory / "frames.json").write_text(json.dumps(manifest))
     _emit("frames", path=str(blob), manifest=manifest)
 
@@ -111,7 +118,7 @@ def main() -> None:
     _emit("mesh", path=str(out), kind="final")
 
     if result.frames:
-        write_frames(result.frames, out.parent)
+        write_frames(result.frames, result.times, out.parent)
 
 
 if __name__ == "__main__":

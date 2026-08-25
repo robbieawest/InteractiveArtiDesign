@@ -135,6 +135,9 @@ const props = defineProps<{
   hasFrames: boolean;
   /** Conditioning view count, for the which-view-guided-this-step readout. */
   viewCount: number;
+  /** Flow time per position, in timeline order. Empty when the capture did
+   *  not record it. */
+  stepTimes: number[];
 }>();
 
 const emit = defineEmits<{
@@ -166,7 +169,13 @@ const stepLabel = computed(() => {
     stage.value === "structure"
       ? props.structureSteps
       : props.length - props.structureSteps;
-  return `step ${within + 1} / ${total}`;
+  // The step index says where you are in the loop; `t` says where you are on
+  // the trajectory, and `rescale_t` makes those two very different things —
+  // on TRELLIS.2's schedule step 11 of 12 is still at t = 0.5, with a third
+  // of the path left for the last step alone.
+  const t = props.stepTimes[props.position];
+  const at = t === undefined ? "" : `  ·  t ${t.toFixed(3)}`;
+  return `step ${within + 1} / ${total}${at}`;
 });
 
 /** Which conditioning view guided this step. In `stochastic` mode the

@@ -38,6 +38,12 @@ export interface FlowFrames {
   align: FlowAlign | null;
   /** Per track, one u8 volume per sampling step, in step order. */
   stages: Record<FlowTrack, Uint8Array[]>;
+  /** The flow time each frame was predicted at, per track, in step order.
+   *  Empty for a capture that did not record them (TRELLIS 1, and TRELLIS.2
+   *  runs from before the field existed) — the scrubber falls back to the
+   *  step index alone. Not derivable on this side: `rescale_t` decides the
+   *  spacing and it lives in the checkpoint. */
+  times: Record<FlowTrack, number[]>;
 }
 
 /** Number of steps in each stage, in timeline order. */
@@ -92,12 +98,22 @@ export function decodeFlowFrames(buffer: ArrayBuffer): FlowFrames {
     grid?: number;
     frameBytes?: number;
     align?: FlowAlign | null;
-    stages?: { name: string; offset: number; steps: number }[];
+    stages?: {
+      name: string;
+      offset: number;
+      steps: number;
+      times?: number[];
+    }[];
   };
 
   const grid = header.grid ?? 64;
   const frameBytes = header.frameBytes ?? grid ** 3;
   const stages: Record<FlowTrack, Uint8Array[]> = {
+    structure: [],
+    latent: [],
+    constraint: [],
+  };
+  const times: Record<FlowTrack, number[]> = {
     structure: [],
     latent: [],
     constraint: [],
@@ -121,7 +137,12 @@ export function decodeFlowFrames(buffer: ArrayBuffer): FlowFrames {
       // frames are uploaded to the GPU one at a time
       stages[stage.name as FlowTrack].push(bytes.subarray(start, end));
     }
+    // only when it lines up with the frames actually read — a mismatched
+    // length would silently label the wrong step
+    if (stage.times?.length === stage.steps) {
+      times[stage.name as FlowTrack] = stage.times;
+    }
   }
 
-  return { grid, align: header.align ?? null, stages };
+  return { grid, align: header.align ?? null, stages, times };
 }

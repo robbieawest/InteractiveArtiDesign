@@ -222,6 +222,7 @@
     :surfacing-options="currentOptions"
     :surfacing="surfacingBusy"
     :surfacing-progress="surfacingProgress"
+    :surfacing-message="surfacingMessage"
     :has-surface="hasSurface"
     :surface-color="surfaceColor"
     :surface-opacity="surfaceOpacity"
@@ -256,6 +257,7 @@
     v-if="flowActive || flowHasRaw"
     :length="flowLength"
     :structure-steps="flowStructureSteps"
+    :step-times="flowStepTimes"
     :position="flowPosition"
     :threshold="flowThreshold"
     :density="flowDensity"
@@ -445,6 +447,11 @@ const editingBenchmarkSketch = computed(() => benchmark.state.editing);
 // surfacing job state (the mesh itself lives in SurfacePreview, not here)
 const surfacingBusy = ref(false);
 const surfacingProgress = ref(0);
+// The adapter's own label for what it is doing right now. Distinct from
+// the log: it is one line that keeps being replaced, and for the flow
+// samplers it carries the step's t range, which the percentage cannot —
+// `rescale_t` makes the steps wildly non-uniform.
+const surfacingMessage = ref("");
 const hasSurface = ref(false);
 const surfaceVisible = ref(true);
 const sketchVisible = ref(true);
@@ -479,6 +486,8 @@ let flowView: TrellisInteractiveView | undefined;
 const flowActive = ref(false);
 const flowLength = ref(0);
 const flowStructureSteps = ref(0);
+// The `t` behind each scrub position, when the capture recorded it.
+const flowStepTimes = ref<number[]>([]);
 const flowPosition = ref(0);
 const flowThreshold = ref(0.5);
 const flowDensity = ref(1);
@@ -863,6 +872,7 @@ async function runSurfacing(): Promise<void> {
   const method = surfacingMethod.value;
   surfacingBusy.value = true;
   surfacingProgress.value = 0;
+  surfacingMessage.value = "";
   surfacingLog.value = [];
   // the previous surface stays up until this job has something of its own to
   // show, so a job that fails before producing anything costs nothing
@@ -920,8 +930,10 @@ async function runSurfacing(): Promise<void> {
             margin: 1.2,
             smooth: Boolean(options.surface_smooth),
           },
-          onProgress: (status) =>
-            (surfacingProgress.value = 0.25 * status.progress),
+          onProgress: (status) => {
+            surfacingProgress.value = 0.25 * status.progress;
+            surfacingMessage.value = status.message;
+          },
           onLog: (lines) => {
             surfacingLog.value = [...surfacingLog.value, ...lines].slice(
               -SURFACING_LOG_CAP,
@@ -956,7 +968,10 @@ async function runSurfacing(): Promise<void> {
       method,
       sketch,
       options,
-      onProgress: (status) => (surfacingProgress.value = status.progress),
+      onProgress: (status) => {
+        surfacingProgress.value = status.progress;
+        surfacingMessage.value = status.message;
+      },
       onLog: (lines) => {
         surfacingLog.value = [...surfacingLog.value, ...lines].slice(
           -SURFACING_LOG_CAP,
@@ -1132,6 +1147,7 @@ async function enterFlowView(run: {
   flowActive.value = true;
   flowLength.value = flowView.timelineLength;
   flowStructureSteps.value = flowView.structureSteps;
+  flowStepTimes.value = flowView.stepTimes;
   flowHasRaw.value = run.rawGlb !== null;
   flowViewCount.value = run.views.length;
   flowShowRaw.value = false;
@@ -1149,6 +1165,7 @@ function exitFlowView(): void {
   flowView?.clear();
   flowActive.value = false;
   flowLength.value = 0;
+  flowStepTimes.value = [];
   flowHasRaw.value = false;
   strokeRenderer?.setVisible(sketchVisible.value);
   surfacePreview?.setVisible(surfaceVisible.value);

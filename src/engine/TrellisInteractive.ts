@@ -112,6 +112,16 @@ export class TrellisInteractiveView {
     return this.frames ? stageLengths(this.frames).structure : 0;
   }
 
+  /** Flow time per scrubbable position, structure steps then latent, to
+   *  match `timelineLength`. Empty when the capture recorded none — the
+   *  scrubber then labels by step index alone. */
+  get stepTimes(): number[] {
+    if (!this.frames) return [];
+    const { structure, latent } = this.frames.times;
+    if (structure.length + latent.length !== this.timelineLength) return [];
+    return [...structure, ...latent];
+  }
+
   get isActive(): boolean {
     return this.active;
   }

@@ -5,6 +5,7 @@
 #   cluster/pack.sh 2026-08-02T02-09-46      code + that benchmark's inputs
 #   cluster/pack.sh --changed                only what git says you changed
 #   cluster/pack.sh --changed=origin/main    ...since a ref, commits included
+#   cluster/pack.sh --large                  ...plus the big files (see LARGE)
 #
 # --changed packs the tracked files that differ from a base ref (HEAD by
 # default, so: your uncommitted edits). It is for the second and later sends,
@@ -43,10 +44,14 @@
 #   bench_vns/  the VNS fork study, a separate concern
 #   SampleModels
 #               raw glTF; the sketches are already preprocessed
+#   everything in LARGE below
+#               ~670MB of the ~760MB payload, and none of it changes while
+#               code is being iterated on. Opt in with --large, EVERY time you
+#               want it — there is no memory of what the far side already has.
 #
-# What is deliberately kept, because it is not in git and cannot be refetched
-# without network on the far side:
-#   methods/NeuralSketch2Surf/checkpoints/best_model_jit.pt   (54MB)
+# --large is the flag to remember on a FRESH far side: the NS2S weights are in
+# it, they are not in git, and without network there is no other way to get
+# them. A checkout missing them fails at the first ns2s job, not at unpack.
 #
 # The frontend sources ride along — src/, index.html, vite.config.ts,
 # tsconfig.json, package.json, package-lock.json — so `npm run dev` runs on the
@@ -64,12 +69,54 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 OUT="${OUT:-icf-bundle.tar.gz}"
 
+# The big things, named individually rather than caught by a size filter: a
+# filter would quietly change what a bundle contains as files come and go, and
+# the point of this list is that you can read it and know. Sizes measured
+# 2026-08-23; they are here so a line is worth keeping or deleting on evidence.
+#
+# Left out by default and included only with --large. Every one of them is
+# either static (weights, sample assets, someone's paper figures) or useless on
+# the far side (ROCm build output), so the common case — send the code again,
+# it is what changed — should not carry any of it.
+LARGE=(
+    # 54MB. NS2S's trained weights. THE one that is not in git and cannot be
+    # refetched without network, so a fresh far side needs --large once.
+    surfacing-server/methods/NeuralSketch2Surf/checkpoints
+
+    # 333MB, and the largest thing here by far: nvdiffrast-hip and torchsparse
+    # compiled objects, .o and .so, built against ROCm on this machine. Useless
+    # on a CUDA node — setup_venvs.sh rebuilds there — and TRELLIS-AMD is not
+    # the backend the cluster runs anyway.
+    surfacing-server/methods/TRELLIS-AMD/extensions
+
+    # 110MB of .ply reconstructions upstream ships as example output. Nothing
+    # reads them; they are in the repo because the method's authors put them
+    # there.
+    surfacing-server/methods/NeuVAS/results
+
+    # 61MB + 24MB: NS2S's own example meshes and the paper figures under
+    # tools/image. The sketches this project runs come from benchmarks/.
+    surfacing-server/methods/NeuralSketch2Surf/data
+    surfacing-server/methods/NeuralSketch2Surf/tools/image
+
+    # 36MB + 20MB of upstream demo assets — example images, .ply teasers, the
+    # HDRIs the texturing demo lights with. The adapters touch none of it.
+    surfacing-server/methods/TRELLIS/assets
+    surfacing-server/methods/TRELLIS.2/assets
+
+    # 35MB of the curated .obj sketch dataset that ships with sf3d. Its inputs
+    # come from the job, not from here.
+    surfacing-server/methods/surface-fitting-3d-sketches/input_sketches
+)
+
 BASE=""          # empty = pack everything; otherwise the ref to diff against
+WITH_LARGE=0
 BENCHES=()
 for arg in "$@"; do
     case "$arg" in
         --changed)   BASE="HEAD" ;;
         --changed=*) BASE="${arg#--changed=}" ;;
+        --large)     WITH_LARGE=1 ;;
         -*) echo "unknown flag: $arg" >&2; exit 1 ;;
         *)  BENCHES+=("$arg") ;;
     esac
@@ -94,6 +141,14 @@ done
 EXCLUDES=(--exclude='.git' --exclude='__pycache__' --exclude='*.pyc'
           --exclude='.venv' --exclude='.venv-*' --exclude='jobs' --exclude='bench_vns'
           --exclude='node_modules' --exclude='logs/*' --exclude='manifests/*')
+
+# Anchored paths, not patterns: each LARGE entry is a real directory relative
+# to the repo root, which is how tar sees it given the INCLUDE list below.
+if ((WITH_LARGE == 0)); then
+    for path in "${LARGE[@]}"; do
+        EXCLUDES+=(--exclude="$path")
+    done
+fi
 
 if [[ -z "$BASE" ]]; then
     tar czf "$OUT" "${EXCLUDES[@]}" "${INCLUDE[@]}"
@@ -141,6 +196,16 @@ if ((${#BENCHES[@]} == 0)); then
     echo "  code only — no benchmark inputs included"
 else
     echo "  with inputs for: ${BENCHES[*]}"
+fi
+# Said every time, either way. The failure this prevents — a far side missing
+# the NS2S weights — surfaces minutes later as a job error, by which point the
+# bundle that caused it is out of mind.
+if ((WITH_LARGE)); then
+    echo "  --large: the big paths ARE in this bundle:"
+    printf '    %s\n' "${LARGE[@]}"
+else
+    echo "  large paths NOT included (pass --large to add them):"
+    printf '    %s\n' "${LARGE[@]}"
 fi
 cat <<EOF
 

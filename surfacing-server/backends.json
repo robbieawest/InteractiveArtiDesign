@@ -124,14 +124,26 @@
           "same reason: upstream's setup.sh pins its own torch, which has no",
           "business in the `.venv-*` environments beside the server.",
           "",
-          "ATTN_BACKEND is flash_attn, TRELLIS.2's own default, spelled the",
-          "way its config.py matches it. A card without flash-attn support",
-          "wants `xformers` here instead."
+          "ATTN_BACKEND is xformers, not TRELLIS.2's own flash_attn",
+          "default, for the same reason as TRELLIS 1 above: xformers is a",
+          "prebuilt wheel version-matched to torch on the pytorch index,",
+          "while flash-attn is an sdist that compiles CUDA kernels for",
+          "hours. The install we run only ever puts xformers in the venv,",
+          "so the default named a package that is not there — and it fails",
+          "late, at the first attention call, long after loading.",
+          "",
+          "One variable covers both attention paths: the dense one reads",
+          "ATTN_BACKEND directly (modules/attention/config.py), and the",
+          "sparse one falls back to it when SPARSE_ATTN_BACKEND is unset",
+          "(modules/sparse/config.py). Both whitelist 'xformers'. As on",
+          "TRELLIS 1 the spelling is checked against a list and anything",
+          "off it is dropped in silence, so sdpa is not an option here:",
+          "the sparse list is xformers/flash_attn/flash_attn_3 only."
         ],
         "repo": "methods/TRELLIS.2",
         "python": "methods/TRELLIS.2/.venv/bin/python",
         "env": {
-          "ATTN_BACKEND": "flash_attn",
+          "ATTN_BACKEND": "xformers",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
         }
       }
