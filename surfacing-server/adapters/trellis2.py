@@ -139,17 +139,20 @@ def _dilate(grid: Any, radius: int) -> Any:
     return grown.astype(np.uint8)
 
 
-class SingleViewConditioner(ClientViewsConditioner):
-    """One raised three-quarter render of the strokes.
+class StrokeViewsConditioner(ClientViewsConditioner):
+    """Raised three-quarter renders of the strokes.
 
     Same client renderer as TRELLIS 1, different numbers, and the differences
     are all facts about this model rather than preferences:
 
-      * `count` is 1 because TRELLIS.2 conditions on one image. More views
-        would either be discarded or need an inference-time stacking hack
-        invented for them, and that hack is exactly the confound this method is
-        meant to be measured without. So there is no view-count knob: it is not
-        an experiment, it is what the model takes.
+      * `count` defaults to 1 because TRELLIS.2 was trained on a single image
+        and one view is what it is honestly measured on. It is a knob rather
+        than a constant because the model's *interface* takes several without
+        being taught to: the DINOv3 extractor already stacks a list and the
+        flow model cross-attends to whatever cond it is handed. Above 1 the
+        views are dealt one per model call — upstream TRELLIS 1's own
+        'stochastic' algorithm, ported into `sketchflow/flow.py` rather than
+        invented here.
       * `pitch` and `yaw` put the camera above and off-axis. A single view has
         to carry the whole shape, and a dead-on front view (`count: 1` alone
         gives yaw 0) hides depth entirely — a three-quarter view from above is
@@ -165,9 +168,13 @@ class SingleViewConditioner(ClientViewsConditioner):
     name = "views"
     label = "Client stroke render"
     help = (
-        "A single raised three-quarter render of the strokes, rasterized by "
-        "the editor and sent with the job."
+        "Raised three-quarter renders of the strokes, rasterized by the "
+        "editor and sent with the job."
     )
+    # Declared on the adapter rather than here: `conditioner_params` gates a
+    # conditioner's own parameters on a `conditioner` selector param, and this
+    # adapter has no selector (there is one strategy), so a knob declared here
+    # would be permanently disabled in the UI.
     params: list[dict[str, Any]] = []
     view_spec = {
         **ClientViewsConditioner.view_spec,
@@ -176,13 +183,16 @@ class SingleViewConditioner(ClientViewsConditioner):
         # radians: about 32 degrees up, 40 degrees round
         "pitch": 0.55,
         "yaw": 0.7,
-        "overrides": {},
+        "overrides": {
+            "views_count": "count",
+            "views_layout": "layout",
+        },
     }
 
 
 CONDITIONERS: dict[str, Conditioner] = {
     conditioner.name: conditioner
-    for conditioner in [SingleViewConditioner()]
+    for conditioner in [StrokeViewsConditioner()]
 }
 
 
@@ -201,6 +211,39 @@ class Trellis2Adapter(SurfacingAdapter):
     }
 
     _ALL_PARAMS = [
+        {
+            "name": "views_count",
+            "label": "views",
+            "type": "int",
+            "default": 1,
+            "min": 1,
+            "max": 8,
+            "step": 1,
+            "help": "How many renders of the sketch the model conditions on. "
+            "1 is what TRELLIS.2 was trained on. Above 1 the views are dealt "
+            "out one per model call — TRELLIS 1's 'stochastic' algorithm, "
+            "ported rather than invented — so no single view owns a step. "
+            "That is aimed at the pose problem: one fixed image lets the "
+            "model commit to a frame the sketch constraint cannot then argue "
+            "with, because interpolating latents cannot rotate an object. "
+            "The views are embedded once up front, so this costs nothing per "
+            "step. Under a jumping schedule each cycle of a block sees a "
+            "different view, which is what gives the resampling new evidence "
+            "rather than the same image again.",
+        },
+        {
+            "name": "views_layout",
+            "label": "view layout",
+            "type": "choice",
+            "default": "ring",
+            "choices": ["ring", "helix"],
+            "help": "Where the cameras go when there is more than one. "
+            "'ring' orbits at one elevation, so the views differ in yaw "
+            "alone. 'helix' also climbs as it orbits — the views are less "
+            "alike, which is worth more to a model that gets no camera poses "
+            "than another view from the same height would be. Inert at one "
+            "view, which has nowhere to climb to.",
+        },
         {
             "name": "part_based",
             "label": "Part-based",
@@ -271,19 +314,64 @@ class Trellis2Adapter(SurfacingAdapter):
             "which is off-distribution. Hence the default.",
         },
         {
-            "name": "constraint_strength",
-            "label": "Experiment: inpainting strength",
+            "name": "jump_delta",
+            "label": "Experiment: jump length in t",
             "type": "float",
-            "default": 0.5,
+            "default": 0.1,
+            "min": 0.0,
+            "max": 0.5,
+            "step": 0.05,
+            "help": "RePaint resampling. How far back up the trajectory a "
+            "jump goes, measured in t. The run is tiled into blocks: descend "
+            "until this much t has been covered, redo that same span the "
+            "number of times below, then move on. 0 turns jumping off. "
+            "Measured in t rather than in steps because rescale_t makes the "
+            "steps wildly non-uniform — 'back three steps' is a different "
+            "amount of trajectory at every point in the run — and because in "
+            "t it adapts on its own: at rescale_t 5 the nodes are dense at "
+            "high t, so 0.1 spans four steps at the top and one at the "
+            "bottom, putting the resampling where structure is being decided "
+            "without anything having to place it there. Jumps only happen on "
+            "a constrained run; with nothing pushing the state off the "
+            "marginal there is nothing to reconcile.",
+        },
+        {
+            "name": "jump_cycles",
+            "label": "Experiment: jump cycles per block",
+            "type": "int",
+            "default": 5,
+            "min": 0,
+            "max": 20,
+            "step": 1,
+            "help": "How many times each block is redone — RePaint's "
+            "jump_n_sample. This is PER BLOCK, not across the run: 5 means "
+            "every block is traversed six times, and how many blocks there "
+            "are is decided by the jump length above. Why any of this is "
+            "needed: the model supplies a bounded amount of correction per "
+            "unit of t, so a constraint that re-injects a disagreement on "
+            "every step is fought with one step's worth of correction each "
+            "time and never converges — it tracks the disagreement instead "
+            "of resolving it. Extra passes at the same t buy correction "
+            "budget without moving the time axis the checkpoint was tuned "
+            "on, which is the only other way to get it. Costs a full "
+            "guided pass each, so the run time scales with it.",
+        },
+        {
+            "name": "jump_release",
+            "label": "Experiment: stop jumping below t",
+            "type": "float",
+            "default": 0.6,
             "min": 0.0,
             "max": 1.0,
             "step": 0.05,
-            "help": "How much of the prior survives in a constrained cell. "
-            "1.0 is a full overwrite — with the unmasked mode below that "
-            "means the object IS the sketch, which is not an experiment — and "
-            "0 is no inpainting at all. Without a mask this weight is the "
-            "whole of the constraint, which is why it is the knob that "
-            "matters.",
+            "help": "Blocks whose top is below this do not jump. The tail of "
+            "the run has no disagreement left to reconcile, so cycles spent "
+            "there are cycles wasted. 0.6 is where the constraint's own ramp "
+            "settles and where the guidance interval ends, so the "
+            "constrained, guided and resampled windows coincide. Note that "
+            "the schedule leaves almost no resolution down here: the only "
+            "times below 0.5 are 0.3125 and 0, so anything in (0, 0.31] is "
+            "indistinguishable from 0.",
         },
         {
             "name": "sketch_mask",
@@ -291,6 +379,7 @@ class Trellis2Adapter(SurfacingAdapter):
             "type": "choice",
             "default": "none",
             "choices": ["none", "touched", "dilated"],
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
             "help": "Which latent cells the constraint is written into. "
             "'none' — unmasked mixing over the whole grid, at a strength "
             "below 1 — is the one that works. 'touched' (only cells whose "
@@ -302,6 +391,69 @@ class Trellis2Adapter(SurfacingAdapter):
             "'dilated' widens the patch and has the same cause.",
         },
         {
+            "name": "sketch_fraction",
+            "label": "Experiment: sketch mix fraction at t=1",
+            "type": "float",
+            "default": 0.5,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
+            "help": "How much of each constrained cell comes from the sketch "
+            "rather than from the model's own clean estimate, at the start of "
+            "sampling. It is the 'a' in mixed = (1-a)*estimate + a*sketch, so "
+            "it is a share of an interpolation and has no meaning outside "
+            "[0, 1]: at 1.0 with the unmasked mode the object simply IS the "
+            "sketch, which is not an experiment, and at 0 there is no "
+            "inpainting. Without a mask this is the whole of the constraint, "
+            "which is why it is the knob that matters. It is not a strength "
+            "in any free-scale sense and is deliberately not named one. "
+            "Replaces the old global inpainting strength, which is still "
+            "read as the default for both sources so older configs "
+            "reproduce.",
+        },
+        {
+            "name": "sketch_fraction_end",
+            "label": "Experiment: sketch mix fraction at t=0.6",
+            "type": "float",
+            "default": 0.5,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
+            "help": "The same fraction at t=0.6. The two are the endpoints of "
+            "a line in t, followed below 0.6 as well rather than stopping "
+            "there, and clamped to [0, 1]. Equal values hold the constraint "
+            "flat, which is what it did before this existed. Lowering the "
+            "end is the interesting direction: the sketch is a wireframe, so "
+            "holding it at full fraction while geometry is being finalized "
+            "is what makes the result look like one. A line that ends below "
+            "where it starts crosses zero on its own some way below the "
+            "anchor, which is a release with resolution at every step — the "
+            "hard release below has none under 0.5, where the only times are "
+            "0.3125 and 0.",
+        },
+        {
+            "name": "sketch_onset",
+            "label": "Experiment: hold the sketch off above t",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.005,
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
+            "help": "Do not apply the sketch while t is still above this — "
+            "the mirror of the release below, and 1.0 is off. The case for "
+            "it: the image branch has no pose input, so its coarse structure "
+            "comes out at whatever orientation it infers, while the sketch "
+            "grid is fixed in the strokes' own frame. If the two disagree, "
+            "mixing them at the very top averages two poses and gives "
+            "neither. Letting the image settle a pose first, for a step or "
+            "two only, is the whole of the intent. The first two times on "
+            "the shipped schedule are 0.9821 and 0.9615, so it takes a value "
+            "below 0.9615 to skip both — hence the fine step.",
+        },
+        {
             "name": "sketch_release",
             "label": "Experiment: release the sketch below t",
             "type": "float",
@@ -309,6 +461,7 @@ class Trellis2Adapter(SurfacingAdapter):
             "min": 0.0,
             "max": 1.0,
             "step": 0.05,
+            "enabledWhen": {"param": "sketch_inpaint", "equals": True},
             "help": "Stop applying the constraint once the sampler's time "
             "drops below this. Time runs 1 -> 0, so releasing frees the END "
             "of sampling: hold the strokes while topology is being decided, "
@@ -369,6 +522,52 @@ class Trellis2Adapter(SurfacingAdapter):
             "constraint ends where the ramp does, but moving the release "
             "leaves the ramp exactly where it was, so the two can be swept "
             "independently.",
+        },
+        {
+            "name": "surface_fraction",
+            "label": "Experiment: surface mix fraction at t=1",
+            "type": "float",
+            "default": 0.5,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "surface_inpaint", "equals": True},
+            "help": "The surface's own share of the mix at the start of "
+            "sampling, independent of the sketch's. Separate because the two "
+            "are separate experiments and want opposite schedules: the "
+            "surface is a closed shape and is the thing that can safely be "
+            "held, while the sketch is a wireframe and is the thing that "
+            "should fade. Note this is absolute, unlike the weight below, "
+            "which only decides the ratio between the two where they "
+            "overlap.",
+        },
+        {
+            "name": "surface_fraction_end",
+            "label": "Experiment: surface mix fraction at t=0.6",
+            "type": "float",
+            "default": 0.5,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "enabledWhen": {"param": "surface_inpaint", "equals": True},
+            "help": "The same fraction at t=0.6, the other end of a line in "
+            "t clamped to [0, 1]. Equal values hold it flat. This ramp is "
+            "independent of the thickness ramp even though both are anchored "
+            "at 0.6: thickness says how precisely the surface states where "
+            "the boundary is, this says how hard that statement is applied.",
+        },
+        {
+            "name": "surface_onset",
+            "label": "Experiment: hold the surface off above t",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.005,
+            "enabledWhen": {"param": "surface_inpaint", "equals": True},
+            "help": "Do not apply the surface while t is still above this; "
+            "1.0 is off. Same argument as the sketch's, and the same "
+            "resolution caveat — the first two times are 0.9821 and 0.9615.",
         },
         {
             "name": "surface_release",
@@ -739,11 +938,22 @@ class Trellis2Adapter(SurfacingAdapter):
             "no_image_cond": bool(options.pop("no_image_cond", False)),
             "sketch_inpaint": bool(options.pop("sketch_inpaint", False)),
             "constraint_mix": str(options.pop("constraint_mix", "x0")),
+            # Kept as the fallback the per-source fractions default to, so a
+            # config written before they existed still reproduces. Nothing
+            # declares it any more; only an older saved config carries it.
             "constraint_strength": float(
                 options.pop("constraint_strength", 0.5)
             ),
+            "jump_delta": float(options.pop("jump_delta", 0.1)),
+            "jump_cycles": int(options.pop("jump_cycles", 5)),
+            "jump_release": float(options.pop("jump_release", 0.6)),
             "sketch_mask": str(options.pop("sketch_mask", "none")),
             "sketch_weight": float(options.pop("sketch_weight", 1.0)),
+            "sketch_fraction": float(options.pop("sketch_fraction", 0.5)),
+            "sketch_fraction_end": float(
+                options.pop("sketch_fraction_end", 0.5)
+            ),
+            "sketch_onset": float(options.pop("sketch_onset", 1.0)),
             "sketch_release": float(options.pop("sketch_release", 0.0)),
             "surface_inpaint": bool(options.pop("surface_inpaint", False)),
             "surface_thickness": float(options.pop("surface_thickness", 6.0)),
@@ -751,6 +961,11 @@ class Trellis2Adapter(SurfacingAdapter):
                 options.pop("surface_thickness_end", 2.0)
             ),
             "surface_weight": float(options.pop("surface_weight", 1.0)),
+            "surface_fraction": float(options.pop("surface_fraction", 0.5)),
+            "surface_fraction_end": float(
+                options.pop("surface_fraction_end", 0.5)
+            ),
+            "surface_onset": float(options.pop("surface_onset", 1.0)),
             "surface_release": float(options.pop("surface_release", 0.6)),
             "surface_threshold": float(
                 options.pop("surface_threshold", SURFACE_THRESHOLD)
