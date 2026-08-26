@@ -778,6 +778,7 @@ def run_worker(
     defines: dict[str, str],
     log: LogFn,
     on_progress: Callable[[float, str], None],
+    on_frames: Optional[Callable[[Path, Optional[dict[str, Any]]], None]] = None,
 ) -> tuple[dict[str, Path], Optional[dict[str, Any]]]:
     """Drive one worker subprocess, translating its JSON events into progress
     and log lines.
@@ -785,6 +786,12 @@ def run_worker(
     Returns the files it wrote, keyed by role ("final" always; "raw" and
     "frames" only when the run was asked for them), and the frame manifest that
     goes with the capture.
+
+    `on_frames` fires the moment a capture arrives, rather than at the end.
+    Everything this function returns is discarded when the worker fails, and a
+    capture is finished well before the step that fails — so without a way out
+    at the moment it lands, a flow view is destroyed by a mesh decode it had
+    already outlived.
 
     Shared by both TRELLIS adapters because the protocol is the same protocol:
     a worker in a foreign environment, one JSON object per line, files handed
@@ -832,6 +839,8 @@ def run_worker(
             elif kind == "frames":
                 written["frames"] = Path(event["path"])
                 manifest = event.get("manifest")
+                if on_frames is not None:
+                    on_frames(written["frames"], manifest)
             elif kind == "error":
                 error = event["message"]
         code = proc.wait()

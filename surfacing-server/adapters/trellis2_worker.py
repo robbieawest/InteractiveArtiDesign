@@ -106,19 +106,29 @@ def main() -> None:
 
     import sketchflow
 
-    result = sketchflow.generate(config, log, progress)
+    out = Path(config["out"])
+
+    def on_capture(frames: dict, times: dict) -> None:
+        """Hand the capture over the moment it is finished.
+
+        Before the mesh decode rather than after `generate` returns: the
+        decode is the run's largest allocation and the only step that has
+        failed here, and frames that wait for the end of the run are lost to
+        a failure they had already outlived. The adapter treats a `frames`
+        event as final as soon as it arrives, so this is all it takes for a
+        capture to survive a decode that does not.
+        """
+        write_frames(frames, times, out.parent)
+
+    result = sketchflow.generate(config, log, progress, on_capture)
 
     # TRELLIS works z-up in a normalized cube; the document (and three.js) is
     # y-up. The capture's `to_texture_bytes` applies the same change of basis,
     # so the mesh and the volumes land in one frame.
     axes = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    out = Path(config["out"])
     trimesh.Trimesh(result.vertices @ axes, result.faces).export(out)
     progress("decode", 1.0, "done")
     _emit("mesh", path=str(out), kind="final")
-
-    if result.frames:
-        write_frames(result.frames, result.times, out.parent)
 
 
 if __name__ == "__main__":
